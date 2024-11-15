@@ -1,0 +1,20 @@
+name: egnn
+input_feat_dim: 31 # dim of input node features
+edge_attr_dim: 93 # dim of input edge features
+hidden_dim: 128
+drop_out: 0.1
+depth: 6
+
+update_edge: True
+update_coors: True
+update_global: True
+norm_coors: True
+
+embedding: True
+embedding_dim: 128
+
+norm_feat: True
+embed_ss: -3 # Embedding position of ss
+
+# ipa
+ipa_drop_out: 0.2

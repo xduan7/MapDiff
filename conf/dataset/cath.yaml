@@ -1,0 +1,6 @@
+name: CATH
+train_dir: ./data/cath/cath_process/train/
+val_dir: ./data/cath/cath_process/validation/
+test_dir: ./data/cath/cath_process/test/
+
+marginal_train_dir: data/source/train_marginal_x.pt

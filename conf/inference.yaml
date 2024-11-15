@@ -1,0 +1,13 @@
+defaults:
+  - dataset: cath
+  - model: egnn
+  - diffusion: discrete_default
+  - train: train_diff
+  - comet: basic
+  - mask_prior: default
+
+test_model:
+  path: trained_mapdiff_model_path
+
+comet:
+  comet_use: False

@@ -1,0 +1,24 @@
+defaults:
+  - dataset: cath
+  - model: egnn
+  - diffusion: discrete_default
+  - train: train_mask_ipa
+  - comet: mask_pretrain
+
+hydra:
+  run:
+    dir: ./outputs/${experiment.name}_${now:%Y-%m-%d}_${now:%H-%M-%S}
+  output_subdir: configs
+
+experiment:
+  name: mask_pretrain_ipa
+
+dataset:
+  train_dir: ./data/cath/cath_process/train/
+
+train:
+  train_epochs: 200
+  batch_size: 1
+
+comet:
+  use: True

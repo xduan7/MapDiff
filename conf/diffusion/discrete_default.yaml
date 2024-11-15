@@ -1,0 +1,7 @@
+objective: pred_x0
+timesteps: 500
+ddim_steps: 100
+
+noise_type: marginal
+sample_method: ddim
+ensemble_num: 50

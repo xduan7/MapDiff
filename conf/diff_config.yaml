@@ -1,0 +1,28 @@
+defaults:
+  - dataset: cath
+  - model: egnn
+  - diffusion: discrete_default
+  - train: train_diff
+  - comet: basic
+  - mask_prior: default
+
+hydra:
+  run:
+    dir: ./outputs/${experiment.name}_${now:%Y-%m-%d}_${now:%H-%M-%S}
+  output_subdir: configs
+
+experiment:
+  name: MapDiff
+
+prior_model:
+  path: pretrained_ipa_path
+
+dataset:
+  train_dir: ./data/cath/cath_process/train/
+  val_dir: ./data/cath/cath_process/validation/
+  test_dir: ./data/cath/cath_process/test/
+
+train:
+  save_and_sample_every: 50
+  train_epochs: 100
+  batch_size: 1

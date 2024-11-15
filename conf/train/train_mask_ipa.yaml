@@ -1,0 +1,13 @@
+lr: 5e-4
+weight_decay: 0
+scheduler: True
+
+train_epochs: 200
+batch_size: 8
+clip_grad_norm: 1.0
+save_and_sample_every: 1
+
+candi_rate: 0.6
+mask_rate: 0.8
+replace_rate: 0.1
+keep_rate: 0.1

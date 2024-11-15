@@ -1,0 +1,2 @@
+min_mask_ratio: 0.4
+dev_mask_ratio: 0.2
