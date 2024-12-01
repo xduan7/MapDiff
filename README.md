@@ -7,7 +7,7 @@
 
 <!-- </div> -->
 ## Introduction
-This repository contains the PyTorch implementation of the **MapDiff** framework. It is a deep diffusion model with mask prior-guided denoising to improve the inverse protein folding task. It works on 3D protein backbone structures to iteratively predict the feasible 1D sequences of amino acids.
+This repository contains the PyTorch implementation of the **Ma**sk **p**rior-guided denoising **Diff**usion (**MapDiff**) framework. It is a deep diffusion model with mask prior-guided denoising to improve the inverse protein folding task. It works on 3D protein backbone structures to iteratively predict the feasible 1D sequences of amino acids.
 
 ## Framework
 ![MapDiff](image/MapDiff.png)
