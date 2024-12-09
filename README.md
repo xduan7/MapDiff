@@ -32,7 +32,7 @@ $ pip install prettytable
 $ pip install comet-ml
 
 # clone the repository of MapDiff
-$ git clone https://github.com/pz-white/MapDiff.git
+$ git clone https://github.com/peizhenbai/MapDiff.git
 $ cd MapDiff
 ```
 
