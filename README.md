@@ -4,6 +4,7 @@
 <a href="https://pytorch.org/get-started/locally/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-ee4c2c?logo=pytorch&logoColor=white"></a>
 <a href="https://hydra.cc/"><img alt="Config: Hydra" src="https://img.shields.io/badge/Config-Hydra-89b8cd"></a>
 [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/peizhenbai/MapDiff/blob/main/LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-2412.07815-b31b1b.svg)](http://arxiv.org/abs/2412.07815)
 
 <!-- </div> -->
 ## Introduction
@@ -81,6 +82,17 @@ api_key=YOUR-API-KEY
 **Model Inference**
 
 We provide the inference code to generate the predicted sequence from arbitrary pbd files using the trained MapDiff model. Please refer `model_inference.ipnb` for the detailed usage.
+
+## Citation
+Please cite our [paper](http://arxiv.org/abs/2412.07815) if you find our work useful in your own research.
+```
+@article{bai2024mapdiff,
+  title={Mask prior-guided denoising diffusion improves inverse protein folding}, 
+  author={Peizhen Bai and Filip Miljković and Xianyuan Liu and Leonardo De Maria and Rebecca Croasdale-Wood and Owen Rackham and Haiping Lu},
+  year={2024},
+  journal={arXiv preprint arXiv:2412.07815},
+}
+```
 
 ## Acknowledgements and References
 The code implementation is inspired and partially based on earlier works [3-6]. Thanks for their contributions to the open-source community.
