@@ -7,7 +7,7 @@ defaults:
   - mask_prior: default
 
 test_model:
-  path: trained_mapdiff_model_path
+  path: mapdiff_weight.pt
 
 comet:
   comet_use: False
