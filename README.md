@@ -1,4 +1,4 @@
-# Mask prior-guided denoising diffusion improves inverse protein folding
+# Mask-prior-guided denoising diffusion improves inverse protein folding
 
 <!-- <div align="center"> -->
 <a href="https://pytorch.org/get-started/locally/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-ee4c2c?logo=pytorch&logoColor=white"></a>
@@ -8,7 +8,7 @@
 
 <!-- </div> -->
 ## Introduction
-This repository contains the PyTorch implementation of the **Ma**sk **p**rior-guided denoising **Diff**usion (**MapDiff**) framework. It is a deep diffusion model with mask prior-guided denoising to improve the inverse protein folding task. It works on 3D protein backbone structures to iteratively predict the feasible 1D sequences of amino acids.
+This repository contains the PyTorch implementation of the **Ma**sk-**p**rior-guided denoising **Diff**usion (**MapDiff**) framework. It is a deep diffusion model with mask-prior-guided denoising to improve the inverse protein folding task. It works on 3D protein backbone structures to iteratively predict the feasible 1D sequences of amino acids.
 
 ## Framework
 ![MapDiff](image/MapDiff.png)
@@ -54,9 +54,9 @@ Put the downloaded data under the `./data` folder. Then, run the following comma
 $ python generate_graph_cath.py --download_dir=${download_dir}
 ```
 ## Model Training and Inference
-We provide the configurations for model hyperparameters in `./conf` via [Hydra](https://github.com/facebookresearch/hydra). The training of MapDiff can be divided into the two stages: mask prior IPA pre-training and denoising diffusion network training. You can directly run the following commands to re-run our training pipeline. `config-name` is the pre-defined yaml file in `./conf`. `${train_data}`, `${val_data}` and `${test_data}` are the paths to the processed data for training and evaluation.
+We provide the configurations for model hyperparameters in `./conf` via [Hydra](https://github.com/facebookresearch/hydra). The training of MapDiff can be divided into the two stages: mask-prior IPA pre-training and denoising diffusion network training. You can directly run the following commands to re-run our training pipeline. `config-name` is the pre-defined yaml file in `./conf`. `${train_data}`, `${val_data}` and `${test_data}` are the paths to the processed data for training and evaluation.
 
-**Mask prior IPA pre-raining**
+**Mask-prior IPA pre-raining**
 ```
 $ python mask_ipa_pretrain.py --config-name=mask_pretrain coemt.use=${use_comet} comet.workspace=${your_workspace} dataset.train_dir=${train_data} dataset.val_dir=${val_data}
 ```
@@ -87,12 +87,14 @@ We provide the inference code to generate the predicted sequence from arbitrary 
 Please cite our [paper](http://arxiv.org/abs/2412.07815) if you find our work useful in your own research.
 ```
 @article{bai2024mapdiff,
-  title={Mask prior-guided denoising diffusion improves inverse protein folding}, 
+  title={Mask-prior-guided denoising diffusion improves inverse protein folding}, 
   author={Peizhen Bai and Filip Miljković and Xianyuan Liu and Leonardo De Maria and Rebecca Croasdale-Wood and Owen Rackham and Haiping Lu},
-  journal = {Nature Machine Intelligence},
-  year    = {2025},
+  journal={Nature Machine Intelligence},
+  year={2025},
+  volume={7},
+  pages={876--888},
   publisher={Nature Publishing Group},
-  doi     = {0.1038/s42256-025-01042-6}
+  doi={10.1038/s42256-025-01042-6}
 }
 ```
 
