@@ -53,7 +53,8 @@ Put the downloaded data under the `./data` folder. Then, run the following comma
 ```
 $ python generate_graph_cath.py --download_dir=${download_dir}
 ```
-## Model Training and Inference
+
+## Model Training
 We provide the configurations for model hyperparameters in `./conf` via [Hydra](https://github.com/facebookresearch/hydra). The training of MapDiff can be divided into the two stages: mask-prior IPA pre-training and denoising diffusion network training. You can directly run the following commands to re-run our training pipeline. `config-name` is the pre-defined yaml file in `./conf`. `${train_data}`, `${val_data}` and `${test_data}` are the paths to the processed data for training and evaluation.
 
 **Mask-prior IPA pre-raining**
@@ -79,9 +80,9 @@ api_key=YOUR-API-KEY
 
 - In `./config/comet`, please set `comet.use` to `True` and change `comet.workspace` into the one that you created on Comet.
 
-**Model Inference**
+## Model Inference
 
-We provide the inference code to generate the predicted sequence from arbitrary pbd files using the trained MapDiff model. Please refer `model_inference.ipynb` for the detailed usage. You can download our model checkpoint trained on CATH 4.2 from [here](https://github.com/peizhenbai/MapDiff/releases/download/v1.0.1/mapdiff_weight.pt) for use in the inference pipeline.
+We provide the inference code to predict amino acid sequences from arbitrary pdb structures using the trained weights. Please refer `model_inference.ipynb` for the detailed usage. You can download our model checkpoint trained on CATH 4.2 from [here](https://github.com/peizhenbai/MapDiff/releases/download/v1.0.1/mapdiff_weight.pt) for the inference pipeline.
 
 ## Citation
 Please cite our [paper](https://www.nature.com/articles/s42256-025-01042-6) if you find our work useful in your own research.
