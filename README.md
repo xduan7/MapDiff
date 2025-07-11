@@ -84,7 +84,7 @@ api_key=YOUR-API-KEY
 We provide the inference code to generate the predicted sequence from arbitrary pbd files using the trained MapDiff model. Please refer `model_inference.ipynb` for the detailed usage. You can download our model checkpoint trained on CATH 4.2 from [here](https://github.com/peizhenbai/MapDiff/releases/download/v1.0.1/mapdiff_weight.pt) for use in the inference pipeline.
 
 ## Citation
-Please cite our [paper](http://arxiv.org/abs/2412.07815) if you find our work useful in your own research.
+Please cite our [paper](https://www.nature.com/articles/s42256-025-01042-6) if you find our work useful in your own research.
 ```
 @article{bai2024mapdiff,
   title={Mask-prior-guided denoising diffusion improves inverse protein folding}, 
