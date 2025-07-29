@@ -1,4 +1,4 @@
-project_name: "diff_pif"
-workspace: "your_workspace"
+project_name: "mapdiff-eval"
+workspace: "xduan7"
 use: True
 comet_tag: null

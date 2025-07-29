@@ -1,0 +1,33 @@
+defaults:
+  - dataset: cath
+  - model: egnn
+  - diffusion: discrete_default
+  - comet: basic
+  - mask_prior: default
+
+hydra:
+  run:
+    dir: ./outputs/evaluation_${now:%Y-%m-%d}_${now:%H-%M-%S}
+  output_subdir: configs
+
+experiment:
+  name: MapDiff_Evaluation
+
+evaluation:
+  checkpoint_path: ./mapdiff_weight.pt
+  batch_size: 1
+  num_workers: 8
+  ensemble_num: 50  # Number of ensemble predictions
+  ddim_steps: 10    # DDIM sampling steps
+  evaluate_val: true
+  evaluate_test: true
+  
+logging:
+  save_tables: true      # Save PrettyTable output
+  save_json: true        # Save results as JSON
+  save_csv: true         # Save results as CSV
+  use_comet: true        # Use Comet ML logging (requires API key)
+  verbose: true          # Print detailed progress
+
+prior_model:
+  path: none  # Not needed for evaluation since it's loaded from checkpoint
