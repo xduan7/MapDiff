@@ -28,7 +28,7 @@ evaluation:
   use_compile: true   # Use torch.compile (requires PyTorch 2.0+)
   # Multi-GPU settings
   use_multi_gpu: false  # Set to true to use multiple GPUs
-  batch_size_per_gpu: 1  # Batch size per GPU when using multi-GPU
+  batch_size_per_gpu: 4  # Batch size per GPU when using multi-GPU (increase for better GPU utilization)
   max_gpus: 8          # Maximum number of GPUs to use
   master_port: 12355   # Port for distributed communication
   

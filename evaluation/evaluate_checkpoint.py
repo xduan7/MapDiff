@@ -30,7 +30,10 @@ try:
     TORCHMETRICS_AVAILABLE = True
 except ImportError:
     TORCHMETRICS_AVAILABLE = False
-    print("Warning: TorchMetrics not available. Using fallback implementation.")
+    # Only print warning once
+    import os
+    if os.environ.get('LOCAL_RANK', '0') == '0' and os.environ.get('RANK', '0') == '0':
+        print("Warning: TorchMetrics not available. Using fallback implementation.")
 
 
 def cal_stats_metric(values):
@@ -135,22 +138,25 @@ class StreamingMetrics:
 
 def vectorized_ensemble_sample(model, g_batch, ipa_batch, ensemble_num, cfg, use_amp=False):
     """Use torch.vmap for efficient ensemble predictions if available."""
-    # Check if torch.vmap is available
-    if hasattr(torch, 'vmap') and hasattr(torch, 'func'):
+    # Disable vmap for now - it doesn't work well with complex models
+    use_vmap = False
+    
+    if use_vmap and hasattr(torch, 'vmap') and hasattr(torch, 'func'):
         try:
             # Create a function that runs a single ensemble member
-            def single_ensemble():
+            def single_ensemble(dummy):
                 return model.mc_ddim_sample(g_batch, ipa_batch, 
                                           diverse=True, 
                                           step=cfg.evaluation.ddim_steps)
             
             # Vectorize over ensemble dimension
-            ensemble_fn = torch.vmap(single_ensemble, in_dims=None, out_dims=0)
-            all_logits, _ = ensemble_fn()
+            ensemble_fn = torch.vmap(single_ensemble, in_dims=0, out_dims=0)
+            dummy_input = torch.zeros(ensemble_num)
+            all_logits, _ = ensemble_fn(dummy_input)
             return all_logits
         except Exception as e:
             # Fallback to sequential if vmap fails
-            print(f"torch.vmap failed, falling back to sequential: {e}")
+            pass
     
     # Fallback: Sequential ensemble predictions
     ens_logits = []
@@ -481,14 +487,21 @@ def worker_fn_improved(rank, world_size, cfg, dataset, dataset_name, result_queu
         dataset,
         batch_size=cfg.evaluation.get('batch_size_per_gpu', cfg.evaluation.batch_size),
         sampler=sampler,
-        num_workers=cfg.evaluation.num_workers // world_size,
+        num_workers=max(2, cfg.evaluation.num_workers // world_size),
         collate_fn=collator,
-        pin_memory=True
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
     )
     
     # Initialize streaming metrics and evaluator
     metrics = StreamingMetrics(device=device, distributed=True)
     evaluator = Evaluator()
+    
+    # Move BLOSUM matrices to GPU if available
+    if evaluator.blosum_eval and hasattr(evaluator, 'blosum_mats'):
+        for blosum_name in evaluator.blosum_mats.keys():
+            evaluator.blosum_mats[blosum_name] = evaluator.blosum_mats[blosum_name].to(device)
     
     # BLOSUM tracking
     local_nssr42, local_nssr62, local_nssr80, local_nssr90 = [], [], [], []
@@ -537,8 +550,8 @@ def worker_fn_improved(rank, world_size, cfg, dataset, dataset_name, result_queu
     results = metrics.compute()
     
     # Aggregate BLOSUM metrics if available
-    if evaluator.blosum_eval and rank == 0:
-        # Gather BLOSUM metrics from all processes
+    if evaluator.blosum_eval:
+        # All ranks must participate in gather_object
         all_nssr42 = [None] * world_size if rank == 0 else None
         all_nssr62 = [None] * world_size if rank == 0 else None
         all_nssr80 = [None] * world_size if rank == 0 else None
@@ -549,6 +562,7 @@ def worker_fn_improved(rank, world_size, cfg, dataset, dataset_name, result_queu
         dist.gather_object(local_nssr80, all_nssr80, dst=0)
         dist.gather_object(local_nssr90, all_nssr90, dst=0)
         
+        # Only rank 0 processes the gathered results
         if rank == 0:
             # Flatten lists
             nssr42 = [item for sublist in all_nssr42 for item in sublist]
