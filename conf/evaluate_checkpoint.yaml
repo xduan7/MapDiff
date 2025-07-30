@@ -15,12 +15,22 @@ experiment:
 
 evaluation:
   checkpoint_path: ./mapdiff_weight.pt
-  batch_size: 1
-  num_workers: 8
-  ensemble_num: 50  # Number of ensemble predictions
-  ddim_steps: 10    # DDIM sampling steps
+  batch_size: 4
+  num_workers: 16
+  ensemble_num: 50    # Number of ensemble predictions
+  ddim_steps: 10      # DDIM sampling steps
   evaluate_val: true
   evaluate_test: true
+  # Optimization settings
+  fast_eval: false    # Set to true for faster evaluation with reduced ensemble
+  fast_ensemble_num: 10  # Ensemble size when fast_eval is true
+  use_amp: false      # Use automatic mixed precision (requires GPU)
+  use_compile: false  # Use torch.compile (requires PyTorch 2.0+)
+  # Multi-GPU settings
+  use_multi_gpu: false  # Set to true to use multiple GPUs
+  batch_size_per_gpu: 1  # Batch size per GPU when using multi-GPU
+  max_gpus: 8          # Maximum number of GPUs to use
+  master_port: 12355   # Port for distributed communication
   
 logging:
   save_tables: true      # Save PrettyTable output
