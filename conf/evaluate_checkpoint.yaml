@@ -24,8 +24,8 @@ evaluation:
   # Optimization settings
   fast_eval: false    # Set to true for faster evaluation with reduced ensemble
   fast_ensemble_num: 10  # Ensemble size when fast_eval is true
-  use_amp: false      # Use automatic mixed precision (requires GPU)
-  use_compile: false  # Use torch.compile (requires PyTorch 2.0+)
+  use_amp: false      # Use automatic mixed precision (requires GPU) - may affect numerical results
+  use_compile: true   # Use torch.compile (requires PyTorch 2.0+)
   # Multi-GPU settings
   use_multi_gpu: false  # Set to true to use multiple GPUs
   batch_size_per_gpu: 1  # Batch size per GPU when using multi-GPU
