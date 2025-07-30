@@ -495,7 +495,9 @@ def worker_fn_improved(rank, world_size, cfg, dataset, dataset_name, result_queu
     )
     
     # Initialize streaming metrics and evaluator
-    metrics = StreamingMetrics(device=device, distributed=True)
+    # Allow disabling distributed metrics for per-GPU results
+    distributed_metrics = cfg.evaluation.get('distributed_metrics', False)  # Default to independent GPU evaluation
+    metrics = StreamingMetrics(device=device, distributed=distributed_metrics)
     evaluator = Evaluator()
     
     # Move BLOSUM matrices to GPU if available
@@ -515,6 +517,12 @@ def worker_fn_improved(rank, world_size, cfg, dataset, dataset_name, result_queu
         for batch_idx, (g_batch, ipa_batch) in enumerate(
             tqdm(dataloader, desc=f"GPU {rank}", disable=rank != 0)
         ):
+            # Report progress from rank 0
+            if rank == 0 and batch_idx % 10 == 0:
+                current_protein = batch_idx * cfg.evaluation.get('batch_size_per_gpu', cfg.evaluation.batch_size)
+                total_proteins = len(dataset) // world_size
+                print(f"[GPU {rank}] Processing batch {batch_idx}/{len(dataloader)} (protein ~{current_protein}/{total_proteins})", flush=True)
+            
             g_batch = g_batch.to(device)
             ipa_batch = ipa_batch.to(device) if ipa_batch is not None else None
             

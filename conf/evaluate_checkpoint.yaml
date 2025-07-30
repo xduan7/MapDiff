@@ -31,6 +31,7 @@ evaluation:
   batch_size_per_gpu: 4  # Batch size per GPU when using multi-GPU (increase for better GPU utilization)
   max_gpus: 8          # Maximum number of GPUs to use
   master_port: 12355   # Port for distributed communication
+  distributed_metrics: false  # Set to true for global metrics (requires GPU communication)
   
 logging:
   save_tables: true      # Save PrettyTable output
