@@ -98,12 +98,13 @@ def ensemble_sample_protein(model, g_batch, ipa_batch, ensemble_num, cfg):
 
 def evaluate_single_protein(protein_id, dataset, model, evaluator, cfg, device):
     """Evaluate a single protein with ensemble predictions."""
-    # Get protein data
-    g, ipa = dataset[dataset.IDs.index(protein_id)]
+    # Get protein data by index
+    idx = dataset.list_IDs.index(protein_id)
+    g = dataset.get(idx)
     
     # Create batch of size 1
     collator = CollatorDiff()
-    g_batch, ipa_batch = collator([(g, ipa)])
+    g_batch, ipa_batch = collator([g])  # Pass list with single graph
     
     g_batch = g_batch.to(device)
     ipa_batch = ipa_batch.to(device) if ipa_batch is not None else None
@@ -199,7 +200,7 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=
         print(f"Resuming from checkpoint: {len(processed_ids)} proteins already processed")
     
     # Get list of proteins to process
-    all_protein_ids = dataset.IDs
+    all_protein_ids = dataset.list_IDs
     remaining_ids = [pid for pid in all_protein_ids if pid not in processed_ids]
     
     if not remaining_ids:
