@@ -9,8 +9,6 @@ from tqdm import tqdm
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from dataloader.large_dataset import Cath
 from dataloader.collator import CollatorDiff
@@ -22,18 +20,10 @@ from utils import enable_dropout, set_seed
 from prettytable import PrettyTable
 from datetime import datetime
 import time
-import torch.cuda.amp as amp
-# Import TorchMetrics for distributed evaluation
-try:
-    import torchmetrics
-    from torchmetrics import Accuracy, MeanMetric
-    TORCHMETRICS_AVAILABLE = True
-except ImportError:
-    TORCHMETRICS_AVAILABLE = False
-    # Only print warning once
-    import os
-    if os.environ.get('LOCAL_RANK', '0') == '0' and os.environ.get('RANK', '0') == '0':
-        print("Warning: TorchMetrics not available. Using fallback implementation.")
+import pickle
+from pathlib import Path
+import queue
+import threading
 
 
 def cal_stats_metric(values):
@@ -41,221 +31,6 @@ def cal_stats_metric(values):
     median_value = np.median(values)
     std_value = np.std(values)
     return mean_value, median_value, std_value
-
-
-def save_results_json(results, filepath):
-    """Save results as JSON file."""
-    with open(filepath, 'w') as f:
-        json.dump(results, f, indent=4)
-
-
-def save_results_csv(results, filepath):
-    """Save results as CSV file."""
-    # Flatten nested dictionaries
-    rows = []
-    for dataset_name, metrics in results.items():
-        for metric_name, value in metrics.items():
-            rows.append({
-                'dataset': dataset_name,
-                'metric': metric_name,
-                'value': value
-            })
-    
-    with open(filepath, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['dataset', 'metric', 'value'])
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-class StreamingMetrics:
-    """Streaming metrics calculator to avoid memory accumulation."""
-    
-    def __init__(self, device='cpu', distributed=False):
-        self.device = device
-        self.distributed = distributed
-        self.reset()
-    
-    def reset(self):
-        self.total_correct = torch.tensor(0, dtype=torch.long, device=self.device)
-        self.total_samples = torch.tensor(0, dtype=torch.long, device=self.device)
-        self.total_log_probs = torch.tensor(0.0, dtype=torch.float, device=self.device)
-        self.per_sample_recoveries = []
-        
-        if TORCHMETRICS_AVAILABLE:
-            self.accuracy = Accuracy(task="multiclass", num_classes=20).to(self.device)
-            self.perplexity = MeanMetric().to(self.device)
-    
-    def update(self, logits, targets):
-        """Update metrics with a batch of predictions."""
-        preds = logits.argmax(dim=1)
-        targets_idx = targets.argmax(dim=1)
-        
-        # Update accuracy
-        correct = (preds == targets_idx).sum()
-        self.total_correct += correct
-        self.total_samples += targets.shape[0]
-        
-        # Update perplexity components
-        log_probs = F.log_softmax(logits, dim=-1)
-        target_log_probs = torch.gather(log_probs, 1, targets_idx.unsqueeze(1)).squeeze()
-        self.total_log_probs += target_log_probs.sum()
-        
-        # Calculate per-sample recovery
-        batch_recovery = (preds == targets_idx).float().mean().item()
-        self.per_sample_recoveries.append(batch_recovery)
-        
-        if TORCHMETRICS_AVAILABLE:
-            self.accuracy.update(preds, targets_idx)
-            # Calculate batch perplexity
-            batch_perplexity = torch.exp(-target_log_probs.mean())
-            self.perplexity.update(batch_perplexity)
-    
-    def compute(self):
-        """Compute final metrics."""
-        # Reduce metrics across processes if distributed
-        if self.distributed:
-            dist.all_reduce(self.total_correct, op=dist.ReduceOp.SUM)
-            dist.all_reduce(self.total_samples, op=dist.ReduceOp.SUM)
-            dist.all_reduce(self.total_log_probs, op=dist.ReduceOp.SUM)
-        
-        full_recovery = (self.total_correct.float() / self.total_samples.float()).item()
-        perplexity = torch.exp(-self.total_log_probs / self.total_samples).item()
-        
-        # Calculate stats from per-sample recoveries
-        mean_recovery, median_recovery, std_recovery = cal_stats_metric(self.per_sample_recoveries)
-        
-        results = {
-            'mean_recovery': mean_recovery,
-            'median_recovery': median_recovery,
-            'std_recovery': std_recovery,
-            'full_recovery': full_recovery,
-            'perplexity': perplexity,
-            'num_samples': len(self.per_sample_recoveries)
-        }
-        
-        return results
-
-
-def vectorized_ensemble_sample(model, g_batch, ipa_batch, ensemble_num, cfg, use_amp=False):
-    """Use torch.vmap for efficient ensemble predictions if available."""
-    # Disable vmap for now - it doesn't work well with complex models
-    use_vmap = False
-    
-    if use_vmap and hasattr(torch, 'vmap') and hasattr(torch, 'func'):
-        try:
-            # Create a function that runs a single ensemble member
-            def single_ensemble(dummy):
-                return model.mc_ddim_sample(g_batch, ipa_batch, 
-                                          diverse=True, 
-                                          step=cfg.evaluation.ddim_steps)
-            
-            # Vectorize over ensemble dimension
-            ensemble_fn = torch.vmap(single_ensemble, in_dims=0, out_dims=0)
-            dummy_input = torch.zeros(ensemble_num)
-            all_logits, _ = ensemble_fn(dummy_input)
-            return all_logits
-        except Exception as e:
-            # Fallback to sequential if vmap fails
-            pass
-    
-    # Fallback: Sequential ensemble predictions
-    ens_logits = []
-    for _ in range(ensemble_num):
-        if use_amp:
-            with amp.autocast():
-                logits, _ = model.mc_ddim_sample(g_batch, ipa_batch, 
-                                               diverse=True, 
-                                               step=cfg.evaluation.ddim_steps)
-        else:
-            logits, _ = model.mc_ddim_sample(g_batch, ipa_batch, 
-                                           diverse=True, 
-                                           step=cfg.evaluation.ddim_steps)
-        ens_logits.append(logits.detach())
-    
-    return torch.stack(ens_logits)
-
-
-def evaluate_dataset(model, dataloader, evaluator, device, cfg, dataset_name="Dataset"):
-    """Evaluate model on a dataset with streaming metrics to avoid memory accumulation."""
-    model.eval()
-    enable_dropout(model)
-    
-    # Initialize streaming metrics
-    metrics = StreamingMetrics(device=device, distributed=False)
-    
-    # Tracking for BLOSUM metrics
-    nssr42, nssr62, nssr80, nssr90 = [], [], [], []
-    
-    if cfg.logging.verbose:
-        print(f"\nEvaluating on {dataset_name}...")
-        print(f"Total batches: {len(dataloader)}")
-    
-    # Get optimization settings
-    use_amp = hasattr(cfg.evaluation, 'use_amp') and cfg.evaluation.use_amp and device.type == 'cuda'
-    fast_eval = hasattr(cfg.evaluation, 'fast_eval') and cfg.evaluation.fast_eval
-    ensemble_num = cfg.evaluation.fast_ensemble_num if fast_eval else cfg.evaluation.ensemble_num
-    
-    # More aggressive cache clearing frequency
-    cache_clear_freq = 5 if ensemble_num > 20 else 10
-    
-    if use_amp:
-        print(f"Using automatic mixed precision (AMP)")
-    if fast_eval:
-        print(f"Fast evaluation mode: ensemble size reduced to {ensemble_num}")
-    
-    with torch.no_grad():
-        for batch_idx, (g_batch, ipa_batch) in enumerate(tqdm(dataloader, desc=f"Processing {dataset_name}", 
-                                      disable=not cfg.logging.verbose)):
-            g_batch = g_batch.to(device)
-            ipa_batch = ipa_batch.to(device) if ipa_batch is not None else None
-            
-            # Get ensemble predictions
-            ensemble_logits = vectorized_ensemble_sample(
-                model, g_batch, ipa_batch, ensemble_num, cfg, use_amp
-            )
-            
-            # Compute mean logits
-            mean_logits = ensemble_logits.mean(dim=0)
-            
-            # Free ensemble memory immediately
-            del ensemble_logits
-            
-            # Update streaming metrics
-            metrics.update(mean_logits, g_batch.x)
-            
-            # Calculate BLOSUM metrics if needed
-            if evaluator.blosum_eval:
-                sample_logits = mean_logits.argmax(dim=1)
-                sample_seq = g_batch.x.argmax(dim=1)
-                sample_nssr42, sample_nssr62, sample_nssr80, sample_nssr90 = evaluator.cal_all_blosum_nssr(
-                    sample_logits, sample_seq)
-                nssr42.append(sample_nssr42)
-                nssr62.append(sample_nssr62)
-                nssr80.append(sample_nssr80)
-                nssr90.append(sample_nssr90)
-            
-            # Clear GPU cache more frequently
-            if device.type == 'cuda' and (batch_idx + 1) % cache_clear_freq == 0:
-                torch.cuda.empty_cache()
-    
-    # Compute final metrics
-    results = metrics.compute()
-    
-    # Add BLOSUM metrics if available
-    if evaluator.blosum_eval:
-        mean_nssr42, median_nssr42, std_nssr42 = cal_stats_metric(nssr42)
-        mean_nssr62, median_nssr62, std_nssr62 = cal_stats_metric(nssr62)
-        mean_nssr80, median_nssr80, std_nssr80 = cal_stats_metric(nssr80)
-        mean_nssr90, median_nssr90, std_nssr90 = cal_stats_metric(nssr90)
-        
-        results.update({
-            'mean_nssr42': mean_nssr42, 'median_nssr42': median_nssr42, 'std_nssr42': std_nssr42,
-            'mean_nssr62': mean_nssr62, 'median_nssr62': median_nssr62, 'std_nssr62': std_nssr62,
-            'mean_nssr80': mean_nssr80, 'median_nssr80': median_nssr80, 'std_nssr80': std_nssr80,
-            'mean_nssr90': mean_nssr90, 'median_nssr90': median_nssr90, 'std_nssr90': std_nssr90
-        })
-    
-    return results
 
 
 def create_results_table(results, dataset_name):
@@ -281,191 +56,98 @@ def create_results_table(results, dataset_name):
     return table
 
 
-@hydra.main(version_base=None, config_path="../conf", config_name="evaluate_checkpoint")
-def main(cfg: DictConfig):
-    # Initialize Comet ML if requested
-    experiment = None
-    if cfg.logging.use_comet and cfg.comet.use:
-        experiment = Experiment(
-            project_name=cfg.comet.project_name,
-            workspace=cfg.comet.workspace,
-            auto_output_logging="simple",
-            log_graph=False,
-            log_code=False,
-            log_git_metadata=False,
-            log_git_patch=False,
-            auto_param_logging=False,
-            auto_metric_logging=False
-        )
-        experiment.log_parameters(OmegaConf.to_container(cfg))
-        experiment.set_name(cfg.experiment.name)
-        if cfg.comet.comet_tag:
-            experiment.add_tag(cfg.comet.comet_tag)
-        experiment.add_tag("evaluation")
-    
-    # Get output directory from Hydra
-    output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-    
-    print("="*80)
-    print(f"MapDiff Checkpoint Evaluation")
-    print(f"Output directory: {output_dir}")
-    print(f"Checkpoint: {cfg.evaluation.checkpoint_path}")
-    print("="*80)
-    
-    # Check if multi-GPU is requested and available
-    use_multi_gpu = hasattr(cfg.evaluation, 'use_multi_gpu') and cfg.evaluation.use_multi_gpu
-    num_gpus = torch.cuda.device_count() if use_multi_gpu else 1
-    
-    if use_multi_gpu and num_gpus > 1:
-        print(f"Using {num_gpus} GPUs for parallel evaluation")
-        mp.set_start_method('spawn', force=True)
-        # Multi-GPU evaluation
-        evaluate_multi_gpu_main(cfg, output_dir, experiment, num_gpus)
-    else:
-        # Single GPU evaluation
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {device}")
-        evaluate_single_gpu_main(cfg, output_dir, experiment, device)
-    
-    if experiment:
-        experiment.end()
+def save_checkpoint(checkpoint_path, processed_ids, results_dict):
+    """Save evaluation checkpoint for resuming."""
+    checkpoint = {
+        'processed_ids': processed_ids,
+        'results_dict': results_dict,
+        'timestamp': datetime.now().isoformat()
+    }
+    with open(checkpoint_path, 'wb') as f:
+        pickle.dump(checkpoint, f)
 
 
-def evaluate_single_gpu_main(cfg, output_dir, experiment, device):
-    """Main function for single GPU evaluation."""
-    set_seed()
+def load_checkpoint(checkpoint_path):
+    """Load evaluation checkpoint if exists."""
+    if os.path.exists(checkpoint_path):
+        with open(checkpoint_path, 'rb') as f:
+            checkpoint = pickle.load(f)
+        return checkpoint['processed_ids'], checkpoint['results_dict']
+    return set(), {}
+
+
+def ensemble_sample_protein(model, g_batch, ipa_batch, ensemble_num, cfg):
+    """Generate ensemble predictions for a single protein."""
+    ensemble_logits = []
     
-    # Load datasets
-    print("\nLoading datasets...")
-    datasets_to_eval = {}
+    with torch.no_grad():
+        for _ in range(ensemble_num):
+            logits, _ = model.mc_ddim_sample(
+                g_batch, ipa_batch, 
+                diverse=True, 
+                step=cfg.evaluation.ddim_steps
+            )
+            ensemble_logits.append(logits)
     
-    if cfg.evaluation.evaluate_val:
-        val_ID = os.listdir(cfg.dataset.val_dir)
-        val_dataset = Cath(val_ID, cfg.dataset.val_dir)
-        datasets_to_eval['validation'] = val_dataset
-        print(f"Validation dataset size: {len(val_dataset)}")
+    # Stack and average ensemble predictions
+    ensemble_logits = torch.stack(ensemble_logits)
+    mean_logits = ensemble_logits.mean(dim=0)
     
-    if cfg.evaluation.evaluate_test:
-        test_ID = os.listdir(cfg.dataset.test_dir)
-        test_dataset = Cath(test_ID, cfg.dataset.test_dir)
-        datasets_to_eval['test'] = test_dataset
-        print(f"Test dataset size: {len(test_dataset)}")
+    return mean_logits
+
+
+def evaluate_single_protein(protein_id, dataset, model, evaluator, cfg, device):
+    """Evaluate a single protein with ensemble predictions."""
+    # Get protein data
+    g, ipa = dataset[dataset.IDs.index(protein_id)]
     
-    # Initialize evaluator
-    evaluator = Evaluator()
-    
-    # Initialize model
-    print("\nInitializing models...")
-    model, device = initialize_model(cfg, device)
-    
-    # Evaluate each dataset
-    all_results = {}
+    # Create batch of size 1
     collator = CollatorDiff()
+    g_batch, ipa_batch = collator([(g, ipa)])
     
-    for dataset_name, dataset in datasets_to_eval.items():
-        dataloader = DataLoader(
-            dataset, 
-            batch_size=cfg.evaluation.batch_size, 
-            shuffle=False,
-            num_workers=cfg.evaluation.num_workers, 
-            collate_fn=collator,
-            pin_memory=True
-        )
-        
-        start_time = time.time()
-        results = evaluate_dataset(model, dataloader, evaluator, device, cfg, 
-                                 dataset_name.capitalize() + " Set")
-        elapsed_time = time.time() - start_time
-        
-        results['evaluation_time_seconds'] = elapsed_time
-        results['evaluation_time_minutes'] = elapsed_time / 60
-        all_results[dataset_name] = results
-        
-        # Create and print table
-        table = create_results_table(results, dataset_name.capitalize() + " Set")
-        print(f"\n{dataset_name.capitalize()} Set Results:")
-        print(table)
-        print(f"Evaluation time: {elapsed_time/60:.2f} minutes")
-        
-        # Log to Comet ML if enabled
-        if experiment:
-            for metric, value in results.items():
-                experiment.log_metric(f"{dataset_name}_{metric}", value)
+    g_batch = g_batch.to(device)
+    ipa_batch = ipa_batch.to(device) if ipa_batch is not None else None
     
-    # Save results
-    save_evaluation_results(cfg, all_results, output_dir)
+    # Generate ensemble predictions
+    mean_logits = ensemble_sample_protein(
+        model, g_batch, ipa_batch, 
+        cfg.evaluation.ensemble_num, cfg
+    )
+    
+    # Calculate metrics
+    pred_seq = mean_logits.argmax(dim=1)
+    target_seq = g_batch.x.argmax(dim=1)
+    
+    # Recovery
+    recovery = (pred_seq == target_seq).float().mean().item()
+    
+    # Perplexity - using evaluator's method for consistency with original
+    perplexity = evaluator.cal_perplexity(mean_logits, g_batch.x)
+    
+    result = {
+        'protein_id': protein_id,
+        'recovery': recovery,
+        'perplexity': perplexity,
+        'sequence_length': target_seq.shape[0],
+        # Store for dataset-level perplexity calculation
+        'logits': mean_logits.cpu(),
+        'target': g_batch.x.cpu()
+    }
+    
+    # BLOSUM metrics if needed
+    if evaluator.blosum_eval:
+        nssr_scores = evaluator.cal_all_blosum_nssr(pred_seq, target_seq)
+        result['nssr42'] = nssr_scores[0]
+        result['nssr62'] = nssr_scores[1]
+        result['nssr80'] = nssr_scores[2]
+        result['nssr90'] = nssr_scores[3]
+    
+    return result
 
 
-def evaluate_multi_gpu_main(cfg, output_dir, experiment, num_gpus):
-    """Main function for multi-GPU evaluation using improved strategy."""
-    world_size = min(num_gpus, cfg.evaluation.get('max_gpus', num_gpus))
-    
-    # Load datasets
-    print("\nLoading datasets...")
-    datasets_to_eval = {}
-    
-    if cfg.evaluation.evaluate_val:
-        val_ID = os.listdir(cfg.dataset.val_dir)
-        val_dataset = Cath(val_ID, cfg.dataset.val_dir)
-        datasets_to_eval['validation'] = val_dataset
-        print(f"Validation dataset size: {len(val_dataset)}")
-    
-    if cfg.evaluation.evaluate_test:
-        test_ID = os.listdir(cfg.dataset.test_dir)
-        test_dataset = Cath(test_ID, cfg.dataset.test_dir)
-        datasets_to_eval['test'] = test_dataset
-        print(f"Test dataset size: {len(test_dataset)}")
-    
-    all_results = {}
-    
-    for dataset_name, dataset in datasets_to_eval.items():
-        print(f"\nEvaluating {dataset_name} dataset with {world_size} GPUs...")
-        start_time = time.time()
-        
-        # Use multiprocessing queue for results
-        result_queue = mp.Queue()
-        
-        # Spawn worker processes
-        mp.spawn(
-            worker_fn_improved,
-            args=(world_size, cfg, dataset, dataset_name, result_queue),
-            nprocs=world_size,
-            join=True
-        )
-        
-        # Get aggregated results
-        results = result_queue.get()
-        elapsed_time = time.time() - start_time
-        
-        results['evaluation_time_seconds'] = elapsed_time
-        results['evaluation_time_minutes'] = elapsed_time / 60
-        results['num_gpus_used'] = world_size
-        all_results[dataset_name] = results
-        
-        # Create and print table
-        table = create_results_table(results, dataset_name.capitalize() + " Set")
-        print(f"\n{dataset_name.capitalize()} Set Results:")
-        print(table)
-        print(f"Evaluation time: {elapsed_time/60:.2f} minutes ({world_size} GPUs)")
-        
-        # Log to Comet ML if enabled
-        if experiment:
-            for metric, value in results.items():
-                experiment.log_metric(f"{dataset_name}_{metric}", value)
-    
-    # Save results
-    save_evaluation_results(cfg, all_results, output_dir)
-
-
-def worker_fn_improved(rank, world_size, cfg, dataset, dataset_name, result_queue):
-    """Improved worker function using standard data parallelism."""
-    # Set up distributed environment
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(cfg.evaluation.get('master_port', '12355'))
-    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-    
-    # Set device
-    device = torch.device(f'cuda:{rank}')
+def gpu_worker(gpu_id, task_queue, result_queue, cfg, dataset, stop_event):
+    """GPU worker that processes protein tasks from queue."""
+    device = torch.device(f'cuda:{gpu_id}')
     torch.cuda.set_device(device)
     set_seed()
     
@@ -474,210 +156,203 @@ def worker_fn_improved(rank, world_size, cfg, dataset, dataset_name, result_queu
     model.eval()
     enable_dropout(model)
     
-    # Create distributed sampler for the original dataset
-    sampler = DistributedSampler(
-        dataset, 
-        num_replicas=world_size, 
-        rank=rank, 
-        shuffle=False
-    )
-    
-    collator = CollatorDiff()
-    dataloader = DataLoader(
-        dataset,
-        batch_size=cfg.evaluation.get('batch_size_per_gpu', cfg.evaluation.batch_size),
-        sampler=sampler,
-        num_workers=max(2, cfg.evaluation.num_workers // world_size),
-        collate_fn=collator,
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=True
-    )
-    
-    # Initialize streaming metrics and evaluator
-    # Allow disabling distributed metrics for per-GPU results
-    raw_dm_val = cfg.evaluation.get('distributed_metrics', False)
-    distributed_metrics = str(raw_dm_val).lower() == 'true'  # Ensure boolean type
-    
-    # Debug assertion to verify the configuration is parsed correctly
-    if rank == 0:
-        print(f"DEBUG: distributed_metrics raw value: {raw_dm_val} (type: {type(raw_dm_val)})")
-        print(f"DEBUG: distributed_metrics parsed value: {distributed_metrics} (type: {type(distributed_metrics)})")
-    assert isinstance(distributed_metrics, bool), f"distributed_metrics must be bool, got {type(distributed_metrics)}"
-    assert distributed_metrics == False, f"distributed_metrics should be False for independent GPU evaluation, got {distributed_metrics}"
-    
-    metrics = StreamingMetrics(device=device, distributed=distributed_metrics)
+    # Initialize evaluator
     evaluator = Evaluator()
-    
-    # Move BLOSUM matrices to GPU if available
     if evaluator.blosum_eval and hasattr(evaluator, 'blosum_mats'):
         for blosum_name in evaluator.blosum_mats.keys():
             evaluator.blosum_mats[blosum_name] = evaluator.blosum_mats[blosum_name].to(device)
     
-    # BLOSUM tracking
-    local_nssr42, local_nssr62, local_nssr80, local_nssr90 = [], [], [], []
-    
-    # Get optimization settings
-    use_amp = cfg.evaluation.use_amp and device.type == 'cuda'
-    ensemble_num = cfg.evaluation.ensemble_num
-    cache_clear_freq = 5 if ensemble_num > 20 else 10
-    
-    with torch.no_grad():
-        for batch_idx, (g_batch, ipa_batch) in enumerate(
-            tqdm(dataloader, desc=f"GPU {rank}", disable=rank != 0)
-        ):
-            # Report progress from rank 0
-            if rank == 0 and batch_idx % 10 == 0:
-                current_protein = batch_idx * cfg.evaluation.get('batch_size_per_gpu', cfg.evaluation.batch_size)
-                total_proteins = len(dataset) // world_size
-                print(f"[GPU {rank}] Processing batch {batch_idx}/{len(dataloader)} (protein ~{current_protein}/{total_proteins})", flush=True)
+    while not stop_event.is_set():
+        try:
+            # Get next protein to evaluate
+            protein_id = task_queue.get(timeout=1)
             
-            g_batch = g_batch.to(device)
-            ipa_batch = ipa_batch.to(device) if ipa_batch is not None else None
-            
-            # Process all ensemble predictions for this batch
-            ensemble_logits = vectorized_ensemble_sample(
-                model, g_batch, ipa_batch, ensemble_num, cfg, use_amp
+            # Evaluate protein
+            result = evaluate_single_protein(
+                protein_id, dataset, model, evaluator, cfg, device
             )
             
-            # Compute mean logits
-            mean_logits = ensemble_logits.mean(dim=0)
-            del ensemble_logits
+            # Send result back
+            result_queue.put((protein_id, result))
             
-            # Update streaming metrics
-            metrics.update(mean_logits, g_batch.x)
-            
-            # Calculate BLOSUM metrics if needed
-            if evaluator.blosum_eval:
-                for i in range(g_batch.x.shape[0]):
-                    sample_logits = mean_logits[i].argmax(dim=0)
-                    sample_seq = g_batch.x[i].argmax(dim=0)
-                    s42, s62, s80, s90 = evaluator.cal_all_blosum_nssr(
-                        sample_logits.unsqueeze(0), sample_seq.unsqueeze(0))
-                    local_nssr42.append(s42)
-                    local_nssr62.append(s62)
-                    local_nssr80.append(s80)
-                    local_nssr90.append(s90)
-            
-            # Clear cache periodically
-            if (batch_idx + 1) % cache_clear_freq == 0:
-                torch.cuda.empty_cache()
-    
-    # Compute metrics (will be reduced across all processes)
-    results = metrics.compute()
-    
-    # Aggregate BLOSUM metrics if available
-    if evaluator.blosum_eval:
-        if distributed_metrics:
-            # All ranks must participate in gather_object
-            all_nssr42 = [None] * world_size if rank == 0 else None
-            all_nssr62 = [None] * world_size if rank == 0 else None
-            all_nssr80 = [None] * world_size if rank == 0 else None
-            all_nssr90 = [None] * world_size if rank == 0 else None
-            
-            dist.gather_object(local_nssr42, all_nssr42, dst=0)
-            dist.gather_object(local_nssr62, all_nssr62, dst=0)
-            dist.gather_object(local_nssr80, all_nssr80, dst=0)
-            dist.gather_object(local_nssr90, all_nssr90, dst=0)
-            
-            # Only rank 0 processes the gathered results
-            if rank == 0:
-                # Flatten lists
-                nssr42 = [item for sublist in all_nssr42 for item in sublist]
-                nssr62 = [item for sublist in all_nssr62 for item in sublist]
-                nssr80 = [item for sublist in all_nssr80 for item in sublist]
-                nssr90 = [item for sublist in all_nssr90 for item in sublist]
-                
-                # Calculate statistics
-                mean_nssr42, median_nssr42, std_nssr42 = cal_stats_metric(nssr42)
-                mean_nssr62, median_nssr62, std_nssr62 = cal_stats_metric(nssr62)
-                mean_nssr80, median_nssr80, std_nssr80 = cal_stats_metric(nssr80)
-                mean_nssr90, median_nssr90, std_nssr90 = cal_stats_metric(nssr90)
-                
-                results.update({
-                    'mean_nssr42': mean_nssr42, 'median_nssr42': median_nssr42, 'std_nssr42': std_nssr42,
-                    'mean_nssr62': mean_nssr62, 'median_nssr62': median_nssr62, 'std_nssr62': std_nssr62,
-                    'mean_nssr80': mean_nssr80, 'median_nssr80': median_nssr80, 'std_nssr80': std_nssr80,
-                    'mean_nssr90': mean_nssr90, 'median_nssr90': median_nssr90, 'std_nssr90': std_nssr90
-                })
-        else:
-            # Independent GPU evaluation - each GPU calculates its own BLOSUM scores
-            if local_nssr42:
-                mean_nssr42, median_nssr42, std_nssr42 = cal_stats_metric(local_nssr42)
-                mean_nssr62, median_nssr62, std_nssr62 = cal_stats_metric(local_nssr62)
-                mean_nssr80, median_nssr80, std_nssr80 = cal_stats_metric(local_nssr80)
-                mean_nssr90, median_nssr90, std_nssr90 = cal_stats_metric(local_nssr90)
-                
-                results.update({
-                    'mean_nssr42': mean_nssr42, 'median_nssr42': median_nssr42, 'std_nssr42': std_nssr42,
-                    'mean_nssr62': mean_nssr62, 'median_nssr62': median_nssr62, 'std_nssr62': std_nssr62,
-                    'mean_nssr80': mean_nssr80, 'median_nssr80': median_nssr80, 'std_nssr80': std_nssr80,
-                    'mean_nssr90': mean_nssr90, 'median_nssr90': median_nssr90, 'std_nssr90': std_nssr90
-                })
-    
-    # Send results to main process
-    if rank == 0:
-        result_queue.put(results)
-    
-    dist.destroy_process_group()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"GPU {gpu_id} error processing protein: {e}")
+            result_queue.put((protein_id, {'error': str(e)}))
 
 
-def save_evaluation_results(cfg, all_results, output_dir):
-    """Save evaluation results in various formats."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=None):
+    """Evaluate dataset using task-based parallelism."""
+    if num_gpus is None:
+        num_gpus = min(torch.cuda.device_count(), cfg.evaluation.get('max_gpus', 8))
     
-    if cfg.logging.save_tables:
-        # Save pretty tables
-        tables_path = os.path.join(output_dir, "evaluation_tables.txt")
-        with open(tables_path, "w") as f:
-            f.write(f"MapDiff Evaluation Results\n")
-            f.write(f"Timestamp: {timestamp}\n")
-            f.write(f"Checkpoint: {cfg.evaluation.checkpoint_path}\n")
-            f.write("="*80 + "\n\n")
+    print(f"\nEvaluating {dataset_name} with {num_gpus} GPUs using task-based parallelism")
+    print(f"Dataset size: {len(dataset)} proteins")
+    
+    # Create checkpoint path
+    checkpoint_path = os.path.join(output_dir, f"{dataset_name}_checkpoint.pkl")
+    
+    # Load checkpoint if exists
+    processed_ids, results_dict = load_checkpoint(checkpoint_path)
+    if processed_ids:
+        print(f"Resuming from checkpoint: {len(processed_ids)} proteins already processed")
+    
+    # Get list of proteins to process
+    all_protein_ids = dataset.IDs
+    remaining_ids = [pid for pid in all_protein_ids if pid not in processed_ids]
+    
+    if not remaining_ids:
+        print("All proteins already processed!")
+        return aggregate_results(results_dict, dataset_name)
+    
+    # Create queues
+    task_queue = mp.Queue()
+    result_queue = mp.Queue()
+    stop_event = mp.Event()
+    
+    # Fill task queue with remaining proteins
+    for protein_id in remaining_ids:
+        task_queue.put(protein_id)
+    
+    # Start GPU workers
+    workers = []
+    for gpu_id in range(num_gpus):
+        p = mp.Process(
+            target=gpu_worker,
+            args=(gpu_id, task_queue, result_queue, cfg, dataset, stop_event)
+        )
+        p.start()
+        workers.append(p)
+    
+    # Progress tracking
+    start_time = time.time()
+    pbar = tqdm(total=len(remaining_ids), desc=f"Evaluating {dataset_name}")
+    
+    # Collect results
+    try:
+        while len(processed_ids) < len(all_protein_ids):
+            try:
+                protein_id, result = result_queue.get(timeout=30)
+                
+                # Store result
+                results_dict[protein_id] = result
+                processed_ids.add(protein_id)
+                
+                # Update progress
+                pbar.update(1)
+                pbar.set_postfix({
+                    'recovery': f"{result.get('recovery', 0):.3f}",
+                    'gpu_util': f"{task_queue.qsize()}/{num_gpus}"
+                })
+                
+                # Save checkpoint after every protein
+                save_checkpoint(checkpoint_path, processed_ids, results_dict)
+                    
+            except queue.Empty:
+                # Check if all tasks are done
+                if task_queue.empty() and len(processed_ids) == len(all_protein_ids):
+                    break
+                    
+    except KeyboardInterrupt:
+        print("\nEvaluation interrupted by user")
+    finally:
+        # Stop workers
+        stop_event.set()
+        for p in workers:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+        
+        # Save final checkpoint
+        save_checkpoint(checkpoint_path, processed_ids, results_dict)
+        pbar.close()
+    
+    elapsed_time = time.time() - start_time
+    print(f"\nProcessed {len(processed_ids)} proteins in {elapsed_time/60:.2f} minutes")
+    
+    # Aggregate results
+    return aggregate_results(results_dict, dataset_name)
+
+
+def aggregate_results(results_dict, dataset_name):
+    """Aggregate individual protein results into dataset metrics."""
+    recoveries = []
+    total_correct = 0
+    total_samples = 0
+    
+    nssr42_list = []
+    nssr62_list = []
+    nssr80_list = []
+    nssr90_list = []
+    
+    # For dataset-level perplexity calculation (matching original)
+    all_logits = []
+    all_targets = []
+    
+    for protein_id, result in results_dict.items():
+        if 'error' in result:
+            continue
             
-            for dataset_name, results in all_results.items():
-                table = create_results_table(results, dataset_name.capitalize() + " Set")
-                f.write(f"{dataset_name.capitalize()} Set Results:\n")
-                f.write(table.get_string() + "\n\n")
+        recoveries.append(result['recovery'])
         
-        print(f"\nTables saved to: {tables_path}")
-    
-    if cfg.logging.save_json:
-        # Save as JSON
-        json_path = os.path.join(output_dir, "evaluation_results.json")
-        json_data = {
-            'timestamp': timestamp,
-            'checkpoint': cfg.evaluation.checkpoint_path,
-            'config': OmegaConf.to_container(cfg),
-            'results': all_results
-        }
-        save_results_json(json_data, json_path)
-        print(f"JSON results saved to: {json_path}")
-    
-    if cfg.logging.save_csv:
-        # Save as CSV
-        csv_path = os.path.join(output_dir, "evaluation_results.csv")
-        save_results_csv(all_results, csv_path)
-        print(f"CSV results saved to: {csv_path}")
-    
-    # Save summary
-    summary_path = os.path.join(output_dir, "evaluation_summary.txt")
-    with open(summary_path, "w") as f:
-        f.write(f"MapDiff Evaluation Summary\n")
-        f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Checkpoint: {cfg.evaluation.checkpoint_path}\n")
-        f.write(f"Output Directory: {output_dir}\n")
-        f.write("\nKey Results:\n")
+        # Store logits and targets for dataset-level perplexity
+        if 'logits' in result and 'target' in result:
+            all_logits.append(result['logits'])
+            all_targets.append(result['target'])
         
-        for dataset_name, results in all_results.items():
-            f.write(f"\n{dataset_name.capitalize()} Set:\n")
-            f.write(f"  - Median Recovery: {results['median_recovery']:.4f}\n")
-            f.write(f"  - Perplexity: {results['perplexity']:.4f}\n")
-            if 'median_nssr62' in results:
-                f.write(f"  - Median NSSR62: {results['median_nssr62']:.4f}\n")
+        # For full recovery calculation
+        correct = int(result['recovery'] * result['sequence_length'])
+        total_correct += correct
+        total_samples += result['sequence_length']
+        
+        # BLOSUM scores
+        if 'nssr42' in result:
+            nssr42_list.append(result['nssr42'])
+            nssr62_list.append(result['nssr62'])
+            nssr80_list.append(result['nssr80'])
+            nssr90_list.append(result['nssr90'])
     
-    print(f"\nSummary saved to: {summary_path}")
-    print(f"\nAll results saved to: {output_dir}")
+    # Calculate aggregate metrics
+    mean_recovery, median_recovery, std_recovery = cal_stats_metric(recoveries)
+    full_recovery = total_correct / total_samples if total_samples > 0 else 0
+    
+    # Calculate dataset-level perplexity (matching original implementation)
+    if all_logits and all_targets:
+        from evaluator import Evaluator
+        evaluator = Evaluator()
+        all_logits_tensor = torch.cat(all_logits, dim=0)
+        all_targets_tensor = torch.cat(all_targets, dim=0)
+        perplexity = evaluator.cal_perplexity(all_logits_tensor, all_targets_tensor)
+    else:
+        # Fallback to individual perplexities if logits not stored
+        perplexities = [result['perplexity'] for result in results_dict.values() if 'perplexity' in result and 'error' not in result]
+        perplexity = np.mean(perplexities) if perplexities else 0.0
+    
+    results = {
+        'mean_recovery': mean_recovery,
+        'median_recovery': median_recovery,
+        'std_recovery': std_recovery,
+        'full_recovery': full_recovery,
+        'perplexity': mean_perplexity,
+        'num_samples': len(recoveries)
+    }
+    
+    # Add BLOSUM metrics if available
+    if nssr42_list:
+        mean_nssr42, median_nssr42, std_nssr42 = cal_stats_metric(nssr42_list)
+        mean_nssr62, median_nssr62, std_nssr62 = cal_stats_metric(nssr62_list)
+        mean_nssr80, median_nssr80, std_nssr80 = cal_stats_metric(nssr80_list)
+        mean_nssr90, median_nssr90, std_nssr90 = cal_stats_metric(nssr90_list)
+        
+        results.update({
+            'mean_nssr42': mean_nssr42, 'median_nssr42': median_nssr42, 'std_nssr42': std_nssr42,
+            'mean_nssr62': mean_nssr62, 'median_nssr62': median_nssr62, 'std_nssr62': std_nssr62,
+            'mean_nssr80': mean_nssr80, 'median_nssr80': median_nssr80, 'std_nssr80': std_nssr80,
+            'mean_nssr90': mean_nssr90, 'median_nssr90': median_nssr90, 'std_nssr90': std_nssr90
+        })
+    
+    return results
 
 
 def initialize_model(cfg, device=None):
@@ -726,7 +401,7 @@ def initialize_model(cfg, device=None):
         print(f"Checkpoint from step: {checkpoint['step']}")
     
     # Optimization: Compile model if PyTorch 2.0+ and enabled
-    use_compile = cfg.evaluation.get('use_compile', True)  # Default to True
+    use_compile = cfg.evaluation.get('use_compile', True)
     if use_compile and hasattr(torch, 'compile') and device.type == 'cuda':
         print("Compiling model with torch.compile for faster inference...")
         try:
@@ -735,6 +410,100 @@ def initialize_model(cfg, device=None):
             print(f"torch.compile failed, continuing without compilation: {e}")
     
     return model, device
+
+
+def save_evaluation_results(cfg, all_results, output_dir):
+    """Save evaluation results in various formats."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Save pretty tables
+    tables_path = os.path.join(output_dir, "evaluation_tables.txt")
+    with open(tables_path, "w") as f:
+        f.write(f"MapDiff Evaluation Results (Task-Based)\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Checkpoint: {cfg.evaluation.checkpoint_path}\n")
+        f.write("="*80 + "\n\n")
+        
+        for dataset_name, results in all_results.items():
+            table = create_results_table(results, dataset_name.capitalize() + " Set")
+            f.write(f"{dataset_name.capitalize()} Set Results:\n")
+            f.write(table.get_string() + "\n\n")
+    
+    print(f"\nTables saved to: {tables_path}")
+    
+    # Save as JSON
+    json_path = os.path.join(output_dir, "evaluation_results.json")
+    json_data = {
+        'timestamp': timestamp,
+        'checkpoint': cfg.evaluation.checkpoint_path,
+        'config': OmegaConf.to_container(cfg),
+        'results': all_results
+    }
+    with open(json_path, 'w') as f:
+        json.dump(json_data, f, indent=4)
+    print(f"JSON results saved to: {json_path}")
+
+
+@hydra.main(version_base=None, config_path="../conf", config_name="evaluate_checkpoint")
+def main(cfg: DictConfig):
+    # Get output directory from Hydra
+    output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    
+    print("="*80)
+    print(f"MapDiff Checkpoint Evaluation (Task-Based)")
+    print(f"Output directory: {output_dir}")
+    print(f"Checkpoint: {cfg.evaluation.checkpoint_path}")
+    print("="*80)
+    
+    # Check if multi-GPU is available
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        print("No GPUs available! Exiting.")
+        return
+    
+    use_multi_gpu = cfg.evaluation.get('use_multi_gpu', True)
+    if not use_multi_gpu:
+        num_gpus = 1
+    
+    print(f"Using {num_gpus} GPUs for task-based evaluation")
+    
+    # Load datasets
+    print("\nLoading datasets...")
+    datasets_to_eval = {}
+    
+    if cfg.evaluation.evaluate_val:
+        val_ID = os.listdir(cfg.dataset.val_dir)
+        val_dataset = Cath(val_ID, cfg.dataset.val_dir)
+        datasets_to_eval['validation'] = val_dataset
+        print(f"Validation dataset size: {len(val_dataset)}")
+    
+    if cfg.evaluation.evaluate_test:
+        test_ID = os.listdir(cfg.dataset.test_dir)
+        test_dataset = Cath(test_ID, cfg.dataset.test_dir)
+        datasets_to_eval['test'] = test_dataset
+        print(f"Test dataset size: {len(test_dataset)}")
+    
+    # Evaluate each dataset
+    mp.set_start_method('spawn', force=True)
+    all_results = {}
+    
+    for dataset_name, dataset in datasets_to_eval.items():
+        results = evaluate_dataset_taskbased(
+            cfg, dataset, dataset_name, output_dir, num_gpus
+        )
+        all_results[dataset_name] = results
+        
+        # Print results in original format
+        print(f"\n{dataset_name} median recovery rate is {results['median_recovery']:.4f}")
+        print(f"{dataset_name} perplexity is: {results['perplexity']:.4f}")
+        
+        # Also print table for detailed view
+        table = create_results_table(results, dataset_name.capitalize() + " Set")
+        print(f"\n{dataset_name.capitalize()} Set Results (Detailed):")
+        print(table)
+    
+    # Save all results
+    save_evaluation_results(cfg, all_results, output_dir)
 
 
 if __name__ == "__main__":

@@ -27,11 +27,8 @@ evaluation:
   use_amp: false      # Use automatic mixed precision (requires GPU) - may affect numerical results
   use_compile: true   # Use torch.compile (requires PyTorch 2.0+)
   # Multi-GPU settings
-  use_multi_gpu: false  # Set to true to use multiple GPUs
-  batch_size_per_gpu: 4  # Batch size per GPU when using multi-GPU (increase for better GPU utilization)
+  use_multi_gpu: true   # Set to true to use multiple GPUs (task-based parallelism)
   max_gpus: 8          # Maximum number of GPUs to use
-  master_port: 12355   # Port for distributed communication
-  distributed_metrics: false  # Set to true for global metrics (requires GPU communication)
   
 logging:
   save_tables: true      # Save PrettyTable output
