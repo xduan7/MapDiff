@@ -496,7 +496,16 @@ def worker_fn_improved(rank, world_size, cfg, dataset, dataset_name, result_queu
     
     # Initialize streaming metrics and evaluator
     # Allow disabling distributed metrics for per-GPU results
-    distributed_metrics = cfg.evaluation.get('distributed_metrics', False)  # Default to independent GPU evaluation
+    raw_dm_val = cfg.evaluation.get('distributed_metrics', False)
+    distributed_metrics = str(raw_dm_val).lower() == 'true'  # Ensure boolean type
+    
+    # Debug assertion to verify the configuration is parsed correctly
+    if rank == 0:
+        print(f"DEBUG: distributed_metrics raw value: {raw_dm_val} (type: {type(raw_dm_val)})")
+        print(f"DEBUG: distributed_metrics parsed value: {distributed_metrics} (type: {type(distributed_metrics)})")
+    assert isinstance(distributed_metrics, bool), f"distributed_metrics must be bool, got {type(distributed_metrics)}"
+    assert distributed_metrics == False, f"distributed_metrics should be False for independent GPU evaluation, got {distributed_metrics}"
+    
     metrics = StreamingMetrics(device=device, distributed=distributed_metrics)
     evaluator = Evaluator()
     
@@ -559,37 +568,52 @@ def worker_fn_improved(rank, world_size, cfg, dataset, dataset_name, result_queu
     
     # Aggregate BLOSUM metrics if available
     if evaluator.blosum_eval:
-        # All ranks must participate in gather_object
-        all_nssr42 = [None] * world_size if rank == 0 else None
-        all_nssr62 = [None] * world_size if rank == 0 else None
-        all_nssr80 = [None] * world_size if rank == 0 else None
-        all_nssr90 = [None] * world_size if rank == 0 else None
-        
-        dist.gather_object(local_nssr42, all_nssr42, dst=0)
-        dist.gather_object(local_nssr62, all_nssr62, dst=0)
-        dist.gather_object(local_nssr80, all_nssr80, dst=0)
-        dist.gather_object(local_nssr90, all_nssr90, dst=0)
-        
-        # Only rank 0 processes the gathered results
-        if rank == 0:
-            # Flatten lists
-            nssr42 = [item for sublist in all_nssr42 for item in sublist]
-            nssr62 = [item for sublist in all_nssr62 for item in sublist]
-            nssr80 = [item for sublist in all_nssr80 for item in sublist]
-            nssr90 = [item for sublist in all_nssr90 for item in sublist]
+        if distributed_metrics:
+            # All ranks must participate in gather_object
+            all_nssr42 = [None] * world_size if rank == 0 else None
+            all_nssr62 = [None] * world_size if rank == 0 else None
+            all_nssr80 = [None] * world_size if rank == 0 else None
+            all_nssr90 = [None] * world_size if rank == 0 else None
             
-            # Calculate statistics
-            mean_nssr42, median_nssr42, std_nssr42 = cal_stats_metric(nssr42)
-            mean_nssr62, median_nssr62, std_nssr62 = cal_stats_metric(nssr62)
-            mean_nssr80, median_nssr80, std_nssr80 = cal_stats_metric(nssr80)
-            mean_nssr90, median_nssr90, std_nssr90 = cal_stats_metric(nssr90)
+            dist.gather_object(local_nssr42, all_nssr42, dst=0)
+            dist.gather_object(local_nssr62, all_nssr62, dst=0)
+            dist.gather_object(local_nssr80, all_nssr80, dst=0)
+            dist.gather_object(local_nssr90, all_nssr90, dst=0)
             
-            results.update({
-                'mean_nssr42': mean_nssr42, 'median_nssr42': median_nssr42, 'std_nssr42': std_nssr42,
-                'mean_nssr62': mean_nssr62, 'median_nssr62': median_nssr62, 'std_nssr62': std_nssr62,
-                'mean_nssr80': mean_nssr80, 'median_nssr80': median_nssr80, 'std_nssr80': std_nssr80,
-                'mean_nssr90': mean_nssr90, 'median_nssr90': median_nssr90, 'std_nssr90': std_nssr90
-            })
+            # Only rank 0 processes the gathered results
+            if rank == 0:
+                # Flatten lists
+                nssr42 = [item for sublist in all_nssr42 for item in sublist]
+                nssr62 = [item for sublist in all_nssr62 for item in sublist]
+                nssr80 = [item for sublist in all_nssr80 for item in sublist]
+                nssr90 = [item for sublist in all_nssr90 for item in sublist]
+                
+                # Calculate statistics
+                mean_nssr42, median_nssr42, std_nssr42 = cal_stats_metric(nssr42)
+                mean_nssr62, median_nssr62, std_nssr62 = cal_stats_metric(nssr62)
+                mean_nssr80, median_nssr80, std_nssr80 = cal_stats_metric(nssr80)
+                mean_nssr90, median_nssr90, std_nssr90 = cal_stats_metric(nssr90)
+                
+                results.update({
+                    'mean_nssr42': mean_nssr42, 'median_nssr42': median_nssr42, 'std_nssr42': std_nssr42,
+                    'mean_nssr62': mean_nssr62, 'median_nssr62': median_nssr62, 'std_nssr62': std_nssr62,
+                    'mean_nssr80': mean_nssr80, 'median_nssr80': median_nssr80, 'std_nssr80': std_nssr80,
+                    'mean_nssr90': mean_nssr90, 'median_nssr90': median_nssr90, 'std_nssr90': std_nssr90
+                })
+        else:
+            # Independent GPU evaluation - each GPU calculates its own BLOSUM scores
+            if local_nssr42:
+                mean_nssr42, median_nssr42, std_nssr42 = cal_stats_metric(local_nssr42)
+                mean_nssr62, median_nssr62, std_nssr62 = cal_stats_metric(local_nssr62)
+                mean_nssr80, median_nssr80, std_nssr80 = cal_stats_metric(local_nssr80)
+                mean_nssr90, median_nssr90, std_nssr90 = cal_stats_metric(local_nssr90)
+                
+                results.update({
+                    'mean_nssr42': mean_nssr42, 'median_nssr42': median_nssr42, 'std_nssr42': std_nssr42,
+                    'mean_nssr62': mean_nssr62, 'median_nssr62': median_nssr62, 'std_nssr62': std_nssr62,
+                    'mean_nssr80': mean_nssr80, 'median_nssr80': median_nssr80, 'std_nssr80': std_nssr80,
+                    'mean_nssr90': mean_nssr90, 'median_nssr90': median_nssr90, 'std_nssr90': std_nssr90
+                })
     
     # Send results to main process
     if rank == 0:
