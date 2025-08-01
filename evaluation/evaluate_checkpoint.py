@@ -149,14 +149,17 @@ def evaluate_single_protein(protein_id, dataset, model, evaluator, cfg, device):
 
 def gpu_worker(gpu_id, task_queue, result_queue, cfg, stop_event):
     """GPU worker that processes protein tasks from queue."""
+    print(f"Starting GPU worker {gpu_id}")
     device = torch.device(f'cuda:{gpu_id}')
     torch.cuda.set_device(device)
     set_seed()
     
     # Initialize model on this GPU
+    print(f"GPU {gpu_id}: Initializing model on {device}")
     model, _ = initialize_model(cfg, device)
     model.eval()
     enable_dropout(model)
+    print(f"GPU {gpu_id}: Model ready")
     
     # Initialize evaluator
     evaluator = Evaluator()
@@ -258,30 +261,17 @@ def gpu_worker(gpu_id, task_queue, result_queue, cfg, stop_event):
 
 
 def preload_dataset_to_ram(dataset, protein_ids, num_workers=32):
-    """Preload all protein data to RAM using multiple workers."""
-    print(f"Preloading {len(protein_ids)} proteins to RAM using {num_workers} workers...")
+    """Preload all protein data to RAM."""
+    print(f"Preloading {len(protein_ids)} proteins to RAM...")
     
-    def load_single_protein(args):
-        idx, protein_id, dataset = args
+    protein_data_cache = {}
+    for protein_id in tqdm(protein_ids, desc="Loading proteins"):
         try:
+            idx = dataset.list_IDs.index(protein_id)
             g = dataset.get(idx)
-            return protein_id, g
+            protein_data_cache[protein_id] = g
         except Exception as e:
             print(f"Error loading protein {protein_id}: {e}")
-            return protein_id, None
-    
-    # Prepare arguments
-    args_list = [(dataset.list_IDs.index(pid), pid, dataset) for pid in protein_ids]
-    
-    # Load in parallel
-    protein_data_cache = {}
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(load_single_protein, args) for args in args_list]
-        
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Loading proteins"):
-            protein_id, data = future.result()
-            if data is not None:
-                protein_data_cache[protein_id] = data
     
     print(f"Loaded {len(protein_data_cache)} proteins to RAM")
     return protein_data_cache
@@ -344,8 +334,11 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=
     checkpoint_interval = 50  # Save checkpoint every N proteins
     proteins_since_checkpoint = 0
     
+    # Calculate target count for this run
+    target_count = len(processed_ids) + len(remaining_ids)
+    
     try:
-        while len(processed_ids) < len(all_protein_ids):
+        while len(processed_ids) < target_count:
             try:
                 protein_id, result = result_queue.get(timeout=30)
                 
@@ -369,7 +362,7 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=
                     
             except queue.Empty:
                 # Check if all tasks are done
-                if task_queue.empty() and len(processed_ids) == len(all_protein_ids):
+                if task_queue.empty() and len(processed_ids) >= target_count:
                     break
                     
     except KeyboardInterrupt:
@@ -452,7 +445,7 @@ def aggregate_results(results_dict, dataset_name):
         'median_recovery': median_recovery,
         'std_recovery': std_recovery,
         'full_recovery': full_recovery,
-        'perplexity': mean_perplexity,
+        'perplexity': perplexity,
         'num_samples': len(recoveries)
     }
     
