@@ -15,7 +15,7 @@ experiment:
 
 evaluation:
   checkpoint_path: ./mapdiff_weight.pt
-  batch_size: 4
+  batch_size: 4        # Number of proteins to process per batch (per GPU in multi-GPU mode)
   num_workers: 16
   ensemble_num: 50    # Number of ensemble predictions
   ddim_steps: 10      # DDIM sampling steps
@@ -30,7 +30,6 @@ evaluation:
   use_multi_gpu: true   # Set to true to use multiple GPUs (task-based parallelism)
   max_gpus: 8          # Maximum number of GPUs to use
   num_cpu_workers: 32  # Number of CPU workers for data loading (up to 128)
-  batch_size: 4        # Number of proteins to process per GPU batch (improves GPU utilization)
   
 logging:
   save_tables: true      # Save PrettyTable output
