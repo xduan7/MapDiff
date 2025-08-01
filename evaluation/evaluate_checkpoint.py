@@ -24,6 +24,7 @@ import pickle
 from pathlib import Path
 import queue
 import threading
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 def cal_stats_metric(values):
@@ -146,7 +147,7 @@ def evaluate_single_protein(protein_id, dataset, model, evaluator, cfg, device):
     return result
 
 
-def gpu_worker(gpu_id, task_queue, result_queue, cfg, dataset, stop_event):
+def gpu_worker(gpu_id, task_queue, result_queue, cfg, stop_event):
     """GPU worker that processes protein tasks from queue."""
     device = torch.device(f'cuda:{gpu_id}')
     torch.cuda.set_device(device)
@@ -163,24 +164,127 @@ def gpu_worker(gpu_id, task_queue, result_queue, cfg, dataset, stop_event):
         for blosum_name in evaluator.blosum_mats.keys():
             evaluator.blosum_mats[blosum_name] = evaluator.blosum_mats[blosum_name].to(device)
     
+    # Initialize collator once
+    collator = CollatorDiff()
+    
+    # Get batch size from config
+    batch_size = cfg.evaluation.get('batch_size', 4)
+    
     while not stop_event.is_set():
         try:
-            # Get next protein to evaluate
-            protein_id = task_queue.get(timeout=1)
+            # Collect multiple proteins for a batch
+            batch_proteins = []
+            batch_ids = []
             
-            # Evaluate protein
-            result = evaluate_single_protein(
-                protein_id, dataset, model, evaluator, cfg, device
-            )
+            # Try to fill a batch
+            for _ in range(batch_size):
+                try:
+                    protein_id, protein_data = task_queue.get(timeout=0.1)
+                    batch_proteins.append(protein_data)
+                    batch_ids.append(protein_id)
+                except queue.Empty:
+                    break
             
-            # Send result back
-            result_queue.put((protein_id, result))
+            # Skip if no proteins collected
+            if not batch_proteins:
+                continue
+                
+            # Process the batch
+            g_batch, ipa_batch = collator(batch_proteins)
+            g_batch = g_batch.to(device)
+            ipa_batch = ipa_batch.to(device) if ipa_batch is not None else None
             
-        except queue.Empty:
-            continue
+            # Generate ensemble predictions for the batch
+            ensemble_logits = []
+            with torch.no_grad():
+                for _ in range(cfg.evaluation.ensemble_num):
+                    logits, _ = model.mc_ddim_sample(
+                        g_batch, ipa_batch, 
+                        diverse=True, 
+                        step=cfg.evaluation.ddim_steps
+                    )
+                    ensemble_logits.append(logits)
+            
+            # Stack and average ensemble predictions
+            ensemble_logits = torch.stack(ensemble_logits)
+            mean_logits = ensemble_logits.mean(dim=0)
+            
+            # Process results for each protein in the batch
+            batch_idx = g_batch.batch.cpu().numpy()
+            for i, protein_id in enumerate(batch_ids):
+                # Extract this protein's data
+                idx = np.where(batch_idx == i)[0]
+                protein_logits = mean_logits[idx]
+                protein_target = g_batch.x[idx]
+                
+                # Calculate metrics
+                pred_seq = protein_logits.argmax(dim=1)
+                target_seq = protein_target.argmax(dim=1)
+                
+                # Recovery
+                recovery = (pred_seq == target_seq).float().mean().item()
+                
+                # Perplexity
+                perplexity = evaluator.cal_perplexity(protein_logits, protein_target)
+                
+                result = {
+                    'protein_id': protein_id,
+                    'recovery': recovery,
+                    'perplexity': perplexity,
+                    'sequence_length': target_seq.shape[0],
+                    # Store for dataset-level perplexity calculation
+                    'logits': protein_logits.cpu(),
+                    'target': protein_target.cpu()
+                }
+                
+                # BLOSUM metrics if needed
+                if evaluator.blosum_eval:
+                    nssr_scores = evaluator.cal_all_blosum_nssr(pred_seq, target_seq)
+                    result['nssr42'] = nssr_scores[0]
+                    result['nssr62'] = nssr_scores[1]
+                    result['nssr80'] = nssr_scores[2]
+                    result['nssr90'] = nssr_scores[3]
+                
+                # Send result back
+                result_queue.put((protein_id, result))
+            
         except Exception as e:
-            print(f"GPU {gpu_id} error processing protein: {e}")
-            result_queue.put((protein_id, {'error': str(e)}))
+            print(f"GPU {gpu_id} error processing batch: {e}")
+            import traceback
+            traceback.print_exc()
+            # Report errors for all proteins in the failed batch
+            for protein_id in batch_ids:
+                result_queue.put((protein_id, {'error': str(e)}))
+
+
+def preload_dataset_to_ram(dataset, protein_ids, num_workers=32):
+    """Preload all protein data to RAM using multiple workers."""
+    print(f"Preloading {len(protein_ids)} proteins to RAM using {num_workers} workers...")
+    
+    def load_single_protein(args):
+        idx, protein_id, dataset = args
+        try:
+            g = dataset.get(idx)
+            return protein_id, g
+        except Exception as e:
+            print(f"Error loading protein {protein_id}: {e}")
+            return protein_id, None
+    
+    # Prepare arguments
+    args_list = [(dataset.list_IDs.index(pid), pid, dataset) for pid in protein_ids]
+    
+    # Load in parallel
+    protein_data_cache = {}
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(load_single_protein, args) for args in args_list]
+        
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Loading proteins"):
+            protein_id, data = future.result()
+            if data is not None:
+                protein_data_cache[protein_id] = data
+    
+    print(f"Loaded {len(protein_data_cache)} proteins to RAM")
+    return protein_data_cache
 
 
 def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=None):
@@ -207,21 +311,27 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=
         print("All proteins already processed!")
         return aggregate_results(results_dict, dataset_name)
     
-    # Create queues
-    task_queue = mp.Queue()
-    result_queue = mp.Queue()
+    # Preload all data to RAM
+    num_cpu_workers = min(128, mp.cpu_count(), cfg.evaluation.get('num_cpu_workers', 32))
+    protein_data_cache = preload_dataset_to_ram(dataset, remaining_ids, num_cpu_workers)
+    
+    # Create queues with larger capacity
+    task_queue = mp.Queue(maxsize=len(remaining_ids))
+    result_queue = mp.Queue(maxsize=100)
     stop_event = mp.Event()
     
-    # Fill task queue with remaining proteins
+    # Fill task queue with protein data (not just IDs)
+    print("Filling task queue...")
     for protein_id in remaining_ids:
-        task_queue.put(protein_id)
+        if protein_id in protein_data_cache:
+            task_queue.put((protein_id, protein_data_cache[protein_id]))
     
     # Start GPU workers
     workers = []
     for gpu_id in range(num_gpus):
         p = mp.Process(
             target=gpu_worker,
-            args=(gpu_id, task_queue, result_queue, cfg, dataset, stop_event)
+            args=(gpu_id, task_queue, result_queue, cfg, stop_event)
         )
         p.start()
         workers.append(p)
@@ -231,6 +341,9 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=
     pbar = tqdm(total=len(remaining_ids), desc=f"Evaluating {dataset_name}")
     
     # Collect results
+    checkpoint_interval = 50  # Save checkpoint every N proteins
+    proteins_since_checkpoint = 0
+    
     try:
         while len(processed_ids) < len(all_protein_ids):
             try:
@@ -239,16 +352,20 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=
                 # Store result
                 results_dict[protein_id] = result
                 processed_ids.add(protein_id)
+                proteins_since_checkpoint += 1
                 
                 # Update progress
                 pbar.update(1)
                 pbar.set_postfix({
                     'recovery': f"{result.get('recovery', 0):.3f}",
-                    'gpu_util': f"{task_queue.qsize()}/{num_gpus}"
+                    'queue': f"{task_queue.qsize()}",
+                    'gpu_util': f"~{100 - (task_queue.qsize() / max(1, len(remaining_ids)) * 100):.0f}%"
                 })
                 
-                # Save checkpoint after every protein
-                save_checkpoint(checkpoint_path, processed_ids, results_dict)
+                # Save checkpoint periodically
+                if proteins_since_checkpoint >= checkpoint_interval:
+                    save_checkpoint(checkpoint_path, processed_ids, results_dict)
+                    proteins_since_checkpoint = 0
                     
             except queue.Empty:
                 # Check if all tasks are done
