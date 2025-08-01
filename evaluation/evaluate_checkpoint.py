@@ -25,6 +25,9 @@ from pathlib import Path
 import queue
 import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import hashlib
+import fcntl
+import tempfile
 
 
 def cal_stats_metric(values):
@@ -57,24 +60,147 @@ def create_results_table(results, dataset_name):
     return table
 
 
-def save_checkpoint(checkpoint_path, processed_ids, results_dict):
-    """Save evaluation checkpoint for resuming."""
-    checkpoint = {
-        'processed_ids': processed_ids,
-        'results_dict': results_dict,
+def generate_evaluation_hash(cfg):
+    """Generate stable hash from config and script for directory naming."""
+    # Get script path
+    script_path = os.path.abspath(__file__)
+    
+    # Build hash content with key evaluation parameters
+    hash_content = {
+        'checkpoint': cfg.evaluation.checkpoint_path,
+        'batch_size': cfg.evaluation.batch_size,
+        'ensemble_num': cfg.evaluation.ensemble_num,
+        'ddim_steps': cfg.evaluation.ddim_steps,
+        'script_mtime': os.path.getmtime(script_path),
+        'script_size': os.path.getsize(script_path),
+        # Model config
+        'model': OmegaConf.to_container(cfg.model),
+        'diffusion': OmegaConf.to_container(cfg.diffusion),
+        'mask_prior': OmegaConf.to_container(cfg.mask_prior)
+    }
+    
+    # Create stable hash
+    hash_str = json.dumps(hash_content, sort_keys=True)
+    full_hash = hashlib.sha256(hash_str.encode()).hexdigest()
+    
+    # Return truncated hash for directory name and full hash for verification
+    return full_hash[:16], full_hash, hash_content
+
+
+def save_protein_result(result_dir, protein_id, result, schema_version=1):
+    """Save individual protein result with atomic write."""
+    os.makedirs(result_dir, exist_ok=True)
+    
+    # Prepare result data (exclude large tensors)
+    save_data = {
+        'schema_version': schema_version,
+        'protein_id': protein_id,
+        'recovery': result['recovery'],
+        'perplexity': result['perplexity'],
+        'sequence_length': result['sequence_length'],
         'timestamp': datetime.now().isoformat()
     }
-    with open(checkpoint_path, 'wb') as f:
-        pickle.dump(checkpoint, f)
+    
+    # Add BLOSUM scores if available
+    for key in ['nssr42', 'nssr62', 'nssr80', 'nssr90']:
+        if key in result:
+            save_data[key] = result[key]
+    
+    # Atomic write
+    final_path = os.path.join(result_dir, f"{protein_id}.json")
+    temp_path = f"{final_path}.tmp-{os.getpid()}"
+    
+    try:
+        with open(temp_path, 'w') as f:
+            json.dump(save_data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        
+        # Atomic rename
+        os.rename(temp_path, final_path)
+        
+        # Sync directory
+        dir_fd = os.open(result_dir, os.O_RDONLY)
+        os.fsync(dir_fd)
+        os.close(dir_fd)
+        
+    except Exception as e:
+        # Clean up temp file on error
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise e
 
 
-def load_checkpoint(checkpoint_path):
-    """Load evaluation checkpoint if exists."""
-    if os.path.exists(checkpoint_path):
-        with open(checkpoint_path, 'rb') as f:
-            checkpoint = pickle.load(f)
-        return checkpoint['processed_ids'], checkpoint['results_dict']
-    return set(), {}
+def load_protein_results(result_dir, expected_schema=1):
+    """Load all protein results from directory."""
+    results_dict = {}
+    processed_ids = set()
+    
+    if not os.path.exists(result_dir):
+        return processed_ids, results_dict
+    
+    protein_files = [f for f in os.listdir(result_dir) if f.endswith('.json') and not f.startswith('aggregate')]
+    
+    for filename in protein_files:
+        filepath = os.path.join(result_dir, filename)
+        try:
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+            
+            # Check schema version
+            if data.get('schema_version', 0) != expected_schema:
+                print(f"Warning: Skipping {filename} due to schema mismatch")
+                continue
+            
+            protein_id = data['protein_id']
+            processed_ids.add(protein_id)
+            
+            # Reconstruct result dict (excluding schema_version and timestamp)
+            results_dict[protein_id] = {
+                'recovery': data['recovery'],
+                'perplexity': data['perplexity'],
+                'sequence_length': data['sequence_length']
+            }
+            
+            # Add BLOSUM scores if present
+            for key in ['nssr42', 'nssr62', 'nssr80', 'nssr90']:
+                if key in data:
+                    results_dict[protein_id][key] = data[key]
+                    
+        except Exception as e:
+            print(f"Error loading {filename}: {e}")
+            continue
+    
+    return processed_ids, results_dict
+
+
+def save_metadata(metadata_path, hash_info, cfg):
+    """Save metadata about the evaluation run."""
+    metadata = {
+        'hash_short': hash_info[0],
+        'hash_full': hash_info[1],
+        'hash_content': hash_info[2],
+        'timestamp': datetime.now().isoformat(),
+        'config': OmegaConf.to_container(cfg)
+    }
+    
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+
+def verify_metadata(metadata_path, current_hash_info):
+    """Verify that existing metadata matches current configuration."""
+    if not os.path.exists(metadata_path):
+        return False
+    
+    try:
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        # Check if full hash matches
+        return metadata.get('hash_full') == current_hash_info[1]
+    except Exception:
+        return False
 
 
 def ensemble_sample_protein(model, g_batch, ipa_batch, ensemble_num, cfg):
@@ -277,21 +403,26 @@ def preload_dataset_to_ram(dataset, protein_ids, num_workers=32):
     return protein_data_cache
 
 
-def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=None):
-    """Evaluate dataset using task-based parallelism."""
+def evaluate_dataset_taskbased(cfg, dataset, dataset_name, eval_base_dir, hash_info, num_gpus=None):
+    """Evaluate dataset using task-based parallelism with protein-level storage."""
     if num_gpus is None:
         num_gpus = min(torch.cuda.device_count(), cfg.evaluation.get('max_gpus', 8))
     
     print(f"\nEvaluating {dataset_name} with {num_gpus} GPUs using task-based parallelism")
     print(f"Dataset size: {len(dataset)} proteins")
     
-    # Create checkpoint path
-    checkpoint_path = os.path.join(output_dir, f"{dataset_name}_checkpoint.pkl")
+    # Create dataset-specific result directory
+    result_dir = os.path.join(eval_base_dir, dataset_name, 'proteins')
+    os.makedirs(result_dir, exist_ok=True)
     
-    # Load checkpoint if exists
-    processed_ids, results_dict = load_checkpoint(checkpoint_path)
+    # Save metadata for this dataset
+    metadata_path = os.path.join(eval_base_dir, dataset_name, 'metadata.json')
+    save_metadata(metadata_path, hash_info, cfg)
+    
+    # Load existing results
+    processed_ids, results_dict = load_protein_results(result_dir)
     if processed_ids:
-        print(f"Resuming from checkpoint: {len(processed_ids)} proteins already processed")
+        print(f"Found existing results: {len(processed_ids)} proteins already processed")
     
     # Get list of proteins to process
     all_protein_ids = dataset.list_IDs
@@ -342,10 +473,12 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=
             try:
                 protein_id, result = result_queue.get(timeout=30)
                 
-                # Store result
+                # Store result in memory
                 results_dict[protein_id] = result
                 processed_ids.add(protein_id)
-                proteins_since_checkpoint += 1
+                
+                # Save individual protein result immediately
+                save_protein_result(result_dir, protein_id, result)
                 
                 # Update progress
                 pbar.update(1)
@@ -354,11 +487,6 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=
                     'queue': f"{task_queue.qsize()}",
                     'gpu_util': f"~{100 - (task_queue.qsize() / max(1, len(remaining_ids)) * 100):.0f}%"
                 })
-                
-                # Save checkpoint periodically
-                if proteins_since_checkpoint >= checkpoint_interval:
-                    save_checkpoint(checkpoint_path, processed_ids, results_dict)
-                    proteins_since_checkpoint = 0
                     
             except queue.Empty:
                 # Check if all tasks are done
@@ -375,15 +503,20 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, output_dir, num_gpus=
             if p.is_alive():
                 p.terminate()
         
-        # Save final checkpoint
-        save_checkpoint(checkpoint_path, processed_ids, results_dict)
         pbar.close()
     
     elapsed_time = time.time() - start_time
     print(f"\nProcessed {len(processed_ids)} proteins in {elapsed_time/60:.2f} minutes")
     
     # Aggregate results
-    return aggregate_results(results_dict, dataset_name)
+    aggregate_results_data = aggregate_results(results_dict, dataset_name)
+    
+    # Save aggregate results
+    aggregate_path = os.path.join(eval_base_dir, dataset_name, 'aggregate_results.json')
+    with open(aggregate_path, 'w') as f:
+        json.dump(aggregate_results_data, f, indent=2)
+    
+    return aggregate_results_data
 
 
 def aggregate_results(results_dict, dataset_name):
@@ -557,14 +690,51 @@ def save_evaluation_results(cfg, all_results, output_dir):
 
 @hydra.main(version_base=None, config_path="../conf", config_name="evaluate_checkpoint")
 def main(cfg: DictConfig):
-    # Get output directory from Hydra
-    output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    # Generate evaluation hash
+    hash_short, hash_full, hash_content = generate_evaluation_hash(cfg)
     
-    print("="*80)
-    print(f"MapDiff Checkpoint Evaluation (Task-Based)")
-    print(f"Output directory: {output_dir}")
-    print(f"Checkpoint: {cfg.evaluation.checkpoint_path}")
-    print("="*80)
+    # Create hash-based evaluation directory
+    eval_base_dir = os.path.join('evaluation_results', hash_short)
+    
+    # Check if this exact configuration already exists
+    if os.path.exists(eval_base_dir):
+        # Verify metadata matches
+        val_metadata = os.path.join(eval_base_dir, 'validation', 'metadata.json')
+        test_metadata = os.path.join(eval_base_dir, 'test', 'metadata.json')
+        
+        if ((cfg.evaluation.evaluate_val and verify_metadata(val_metadata, (hash_short, hash_full, hash_content))) or
+            (cfg.evaluation.evaluate_test and verify_metadata(test_metadata, (hash_short, hash_full, hash_content)))):
+            print(f"Found existing evaluation with matching configuration: {eval_base_dir}")
+            print("Will resume from existing results...")
+        else:
+            print(f"Warning: Hash collision detected! Directory exists but metadata doesn't match.")
+            print(f"Creating new directory with extended hash...")
+            eval_base_dir = os.path.join('evaluation_results', hash_full[:32])
+    
+    # Create directory with file lock to prevent race conditions
+    os.makedirs(eval_base_dir, exist_ok=True)
+    lock_file = os.path.join(eval_base_dir, '.lock')
+    
+    try:
+        # Acquire exclusive lock
+        with open(lock_file, 'w') as lock_fd:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            
+            print("="*80)
+            print(f"MapDiff Checkpoint Evaluation (Hash-Based Storage)")
+            print(f"Evaluation directory: {eval_base_dir}")
+            print(f"Hash (short): {hash_short}")
+            print(f"Checkpoint: {cfg.evaluation.checkpoint_path}")
+            print("="*80)
+            
+            # Save global metadata
+            global_metadata_path = os.path.join(eval_base_dir, 'evaluation_metadata.json')
+            save_metadata(global_metadata_path, (hash_short, hash_full, hash_content), cfg)
+    
+    except IOError:
+        print(f"Another evaluation is already running in {eval_base_dir}")
+        print("Waiting for it to complete or manually remove the lock file...")
+        return
     
     # Check if multi-GPU is available
     num_gpus = torch.cuda.device_count()
@@ -600,7 +770,8 @@ def main(cfg: DictConfig):
     
     for dataset_name, dataset in datasets_to_eval.items():
         results = evaluate_dataset_taskbased(
-            cfg, dataset, dataset_name, output_dir, num_gpus
+            cfg, dataset, dataset_name, eval_base_dir, 
+            (hash_short, hash_full, hash_content), num_gpus
         )
         all_results[dataset_name] = results
         
@@ -613,8 +784,21 @@ def main(cfg: DictConfig):
         print(f"\n{dataset_name.capitalize()} Set Results (Detailed):")
         print(table)
     
-    # Save all results
-    save_evaluation_results(cfg, all_results, output_dir)
+    # Save summary results in hash directory
+    save_evaluation_results(cfg, all_results, eval_base_dir)
+    
+    # Also save in Hydra output directory for compatibility
+    hydra_output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    save_evaluation_results(cfg, all_results, hydra_output_dir)
+    
+    print(f"\nResults saved to: {eval_base_dir}")
+    print(f"You can review individual protein results in: {eval_base_dir}/{{validation,test}}/proteins/")
+    
+    # Release lock when done
+    try:
+        os.remove(lock_file)
+    except:
+        pass
 
 
 if __name__ == "__main__":
