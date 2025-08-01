@@ -91,7 +91,7 @@ def save_protein_result(result_dir, protein_id, result, schema_version=1):
     """Save individual protein result with atomic write."""
     os.makedirs(result_dir, exist_ok=True)
     
-    # Prepare result data (exclude large tensors)
+    # Prepare result data
     save_data = {
         'schema_version': schema_version,
         'protein_id': protein_id,
@@ -105,6 +105,15 @@ def save_protein_result(result_dir, protein_id, result, schema_version=1):
     for key in ['nssr42', 'nssr62', 'nssr80', 'nssr90']:
         if key in result:
             save_data[key] = result[key]
+    
+    # Save logits and target tensors separately for dataset-level perplexity
+    if 'logits' in result and 'target' in result:
+        # Save tensors to separate file
+        tensor_path = os.path.join(result_dir, f"{protein_id}_tensors.pt")
+        torch.save({
+            'logits': result['logits'],
+            'target': result['target']
+        }, tensor_path)
     
     # Atomic write
     final_path = os.path.join(result_dir, f"{protein_id}.json")
@@ -131,7 +140,7 @@ def save_protein_result(result_dir, protein_id, result, schema_version=1):
         raise e
 
 
-def load_protein_results(result_dir, expected_schema=1):
+def load_protein_results(result_dir, expected_schema=1, load_tensors=False):
     """Load all protein results from directory."""
     results_dict = {}
     processed_ids = set()
@@ -166,6 +175,14 @@ def load_protein_results(result_dir, expected_schema=1):
             for key in ['nssr42', 'nssr62', 'nssr80', 'nssr90']:
                 if key in data:
                     results_dict[protein_id][key] = data[key]
+            
+            # Load tensors if requested (for perplexity calculation)
+            if load_tensors:
+                tensor_path = os.path.join(result_dir, f"{protein_id}_tensors.pt")
+                if os.path.exists(tensor_path):
+                    tensors = torch.load(tensor_path, map_location='cpu')
+                    results_dict[protein_id]['logits'] = tensors['logits']
+                    results_dict[protein_id]['target'] = tensors['target']
                     
         except Exception as e:
             print(f"Error loading {filename}: {e}")
@@ -415,12 +432,10 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, eval_base_dir, hash_i
     result_dir = os.path.join(eval_base_dir, dataset_name, 'proteins')
     os.makedirs(result_dir, exist_ok=True)
     
-    # Save metadata for this dataset
-    metadata_path = os.path.join(eval_base_dir, dataset_name, 'metadata.json')
-    save_metadata(metadata_path, hash_info, cfg)
+    # Metadata already saved during initialization for resume capability
     
-    # Load existing results
-    processed_ids, results_dict = load_protein_results(result_dir)
+    # Load existing results (just IDs, no tensors needed)
+    processed_ids, _ = load_protein_results(result_dir, load_tensors=False)
     if processed_ids:
         print(f"Found existing results: {len(processed_ids)} proteins already processed")
     
@@ -430,7 +445,9 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, eval_base_dir, hash_i
     
     if not remaining_ids:
         print("All proteins already processed!")
-        return aggregate_results(results_dict, dataset_name)
+        # Load all results for aggregation with tensors
+        _, full_results_dict = load_protein_results(result_dir, load_tensors=True)
+        return aggregate_results(full_results_dict, dataset_name)
     
     # Preload all data to RAM
     num_cpu_workers = min(128, mp.cpu_count(), cfg.evaluation.get('num_cpu_workers', 32))
@@ -473,12 +490,20 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, eval_base_dir, hash_i
             try:
                 protein_id, result = result_queue.get(timeout=30)
                 
-                # Store result in memory
-                results_dict[protein_id] = result
-                processed_ids.add(protein_id)
+                # Check for errors before saving
+                if 'error' in result:
+                    error_msg = f"Protein {protein_id} failed: {result['error']}"
+                    print(error_msg)
+                    # Log to file
+                    error_log = os.path.join(result_dir, '../failed_proteins.log')
+                    with open(error_log, 'a') as f:
+                        f.write(f"{datetime.now().isoformat()} - {error_msg}\n")
+                    processed_ids.add(protein_id)  # Mark as processed to skip on resume
+                    continue
                 
                 # Save individual protein result immediately
                 save_protein_result(result_dir, protein_id, result)
+                processed_ids.add(protein_id)
                 
                 # Update progress
                 pbar.update(1)
@@ -508,8 +533,10 @@ def evaluate_dataset_taskbased(cfg, dataset, dataset_name, eval_base_dir, hash_i
     elapsed_time = time.time() - start_time
     print(f"\nProcessed {len(processed_ids)} proteins in {elapsed_time/60:.2f} minutes")
     
-    # Aggregate results
-    aggregate_results_data = aggregate_results(results_dict, dataset_name)
+    # Aggregate results - need to load ALL results from disk with tensors for perplexity
+    print(f"\nAggregating all results for {dataset_name}...")
+    _, full_results_dict = load_protein_results(result_dir, load_tensors=True)
+    aggregate_results_data = aggregate_results(full_results_dict, dataset_name)
     
     # Save aggregate results
     aggregate_path = os.path.join(eval_base_dir, dataset_name, 'aggregate_results.json')
@@ -707,9 +734,13 @@ def main(cfg: DictConfig):
             print(f"Found existing evaluation with matching configuration: {eval_base_dir}")
             print("Will resume from existing results...")
         else:
-            print(f"Warning: Hash collision detected! Directory exists but metadata doesn't match.")
-            print(f"Creating new directory with extended hash...")
-            eval_base_dir = os.path.join('evaluation_results', hash_full[:32])
+            # Only treat as collision if metadata EXISTS but doesn't match
+            if (os.path.exists(val_metadata) or os.path.exists(test_metadata)):
+                print(f"Warning: Hash collision detected! Directory exists but metadata doesn't match.")
+                print(f"Creating new directory with extended hash...")
+                eval_base_dir = os.path.join('evaluation_results', hash_full[:32])
+            else:
+                print(f"Found incomplete evaluation in {eval_base_dir}, resuming...")
     
     # Create directory with file lock to prevent race conditions
     os.makedirs(eval_base_dir, exist_ok=True)
@@ -730,6 +761,15 @@ def main(cfg: DictConfig):
             # Save global metadata
             global_metadata_path = os.path.join(eval_base_dir, 'evaluation_metadata.json')
             save_metadata(global_metadata_path, (hash_short, hash_full, hash_content), cfg)
+            
+            # Save metadata immediately for each dataset to enable resume
+            for dataset_name in ['validation', 'test']:
+                if ((dataset_name == 'validation' and cfg.evaluation.evaluate_val) or
+                    (dataset_name == 'test' and cfg.evaluation.evaluate_test)):
+                    dataset_dir = os.path.join(eval_base_dir, dataset_name)
+                    os.makedirs(dataset_dir, exist_ok=True)
+                    metadata_path = os.path.join(dataset_dir, 'metadata.json')
+                    save_metadata(metadata_path, (hash_short, hash_full, hash_content), cfg)
     
     except IOError:
         print(f"Another evaluation is already running in {eval_base_dir}")
