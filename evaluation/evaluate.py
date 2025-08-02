@@ -539,7 +539,7 @@ def create_results_table(results, dataset_name):
 def main(cfg: DictConfig):
     # Generate hash for results directory
     hash_short, hash_full = generate_evaluation_hash(cfg)
-    results_base_dir = os.path.join('/results', hash_short)
+    results_base_dir = os.path.join('./results', hash_short)
     os.makedirs(results_base_dir, exist_ok=True)
     
     print("="*80)
