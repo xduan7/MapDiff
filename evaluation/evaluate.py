@@ -469,7 +469,7 @@ def evaluate_dataset(model, dataloader, evaluator, device, cfg, dataset_name="Da
                 pred_protein = preds[start:end]
                 target_protein = targets_idx[start:end]
                 protein_correct = (pred_protein == target_protein).sum()
-                protein_samples = end - start
+                protein_samples = int(end - start)  # Convert tensor to int
                 protein_recovery = (protein_correct / protein_samples).item()
                 
                 # Calculate log probabilities
@@ -963,7 +963,7 @@ def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, todo_d
                     pred_protein = pred_seqs[start:end]
                     target_protein = target_seqs[start:end]
                     protein_correct = (pred_protein == target_protein).sum()
-                    protein_samples = end - start
+                    protein_samples = int(end - start)  # Convert tensor to int
                     protein_recovery = (protein_correct / protein_samples).item()
                     
                     # Calculate log probabilities
