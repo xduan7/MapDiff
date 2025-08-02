@@ -886,9 +886,9 @@ def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, todo_d
     
     collator = CollatorDiff()
     
-    # Create custom collate function JUST LIKE SINGLE-GPU
-    def collate_fn(batch):
-        return collate_with_ids(batch, collator)
+    # Create partial function for collate_fn to avoid pickling issues
+    from functools import partial
+    collate_fn = partial(collate_with_ids, original_collator=collator)
     
     dataloader = DataLoader(
         dataset_with_ids,
