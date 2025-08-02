@@ -801,7 +801,7 @@ def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, protei
     collator = CollatorDiff()
     dataloader = DataLoader(
         dataset,
-        batch_size=cfg.evaluation.get('batch_size_per_gpu', cfg.evaluation.batch_size),
+        batch_size=cfg.evaluation.batch_size,
         sampler=sampler,
         num_workers=max(2, cfg.evaluation.num_workers // world_size),
         collate_fn=collator,
