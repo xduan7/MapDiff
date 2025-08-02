@@ -438,45 +438,52 @@ def evaluate_dataset(model, dataloader, evaluator, device, cfg, dataset_name="Da
             # Free ensemble memory immediately
             del ensemble_logits
             
-            # Vectorized processing for the entire batch
+            # Update streaming metrics with batch
+            metrics.update(mean_logits, g_batch)
+            
+            # Process per-protein results using ptr boundaries (FIXED!)
             preds = mean_logits.argmax(dim=-1)
             targets_idx = g_batch.x.argmax(dim=-1)
             
-            # Per-protein metrics
-            protein_correct = (preds == targets_idx).sum(dim=-1)
-            protein_samples = targets_idx.shape[-1]
-            protein_recoveries = protein_correct / protein_samples
-
-            # Log probabilities
-            log_probs = F.log_softmax(mean_logits, dim=-1)
-            target_log_probs = torch.gather(log_probs, -1, targets_idx.unsqueeze(-1)).squeeze(-1)
-            protein_log_probs = target_log_probs.sum(dim=-1)
-
-            # Process each protein in the batch for saving
-            batch_size = g_batch.x.shape[0]
-            for i in range(batch_size):
-                protein_idx = batch_offset + i
+            # Iterate over proteins using ptr boundaries
+            num_proteins = len(g_batch.ptr) - 1
+            for i in range(num_proteins):
+                start, end = g_batch.ptr[i], g_batch.ptr[i+1]
                 
+                # Skip if already processed
                 if batch_protein_ids and batch_protein_ids[i] in processed_proteins:
                     continue
-
+                
+                # Calculate metrics for this protein
+                pred_protein = preds[start:end]
+                target_protein = targets_idx[start:end]
+                protein_correct = (pred_protein == target_protein).sum()
+                protein_samples = end - start
+                protein_recovery = (protein_correct / protein_samples).item()
+                
+                # Calculate log probabilities
+                log_probs = F.log_softmax(mean_logits[start:end], dim=-1)
+                target_log_probs = torch.gather(log_probs, -1, target_protein.unsqueeze(-1)).squeeze(-1)
+                protein_log_prob = target_log_probs.sum().item()
+                
                 protein_result = {
-                    'recovery': protein_recoveries[i].item(),
-                    'correct': protein_correct[i].item(),
+                    'recovery': protein_recovery,
+                    'correct': protein_correct.item(),
                     'samples': protein_samples,
-                    'log_probs': protein_log_probs[i].item()
+                    'log_probs': protein_log_prob
                 }
-
+                
                 if batch_protein_ids and dataset_results_dir:
                     protein_id = batch_protein_ids[i]
                     result_path = os.path.join(dataset_results_dir, f"{protein_id}_result.json")
                     save_protein_result(result_path, protein_result)
                     processed_proteins.add(protein_id)
+                    
+                    # LOG PROGRESS SO WE KNOW WTF IS HAPPENING
+                    if len(processed_proteins) % 100 == 0:
+                        print(f"[PROGRESS] Saved {len(processed_proteins)} proteins to {dataset_results_dir}")
                 
                 protein_results.append(protein_result)
-
-            # Update streaming metrics with batch
-            metrics.update(mean_logits, g_batch)
             
             # Calculate BLOSUM metrics if needed
             if evaluator.blosum_eval:
@@ -493,7 +500,7 @@ def evaluate_dataset(model, dataloader, evaluator, device, cfg, dataset_name="Da
                     nssr80.append(s80)
                     nssr90.append(s90)
             
-            batch_offset += batch_size
+            batch_offset += num_proteins
             
             # Clear GPU cache more frequently
             if device.type == 'cuda' and (batch_idx + 1) % cache_clear_freq == 0:
@@ -766,43 +773,55 @@ def evaluate_multi_gpu_main(cfg, output_dir, experiment, num_gpus, resume_from_d
     
     all_results = {}
     
-    for dataset_name, dataset in datasets_to_eval.items():
+    for dataset_name, full_dataset in datasets_to_eval.items():
         print(f"\nEvaluating {dataset_name} dataset with {world_size} GPUs...")
         
-        # Check for existing results first
-        dataset_results_dir = os.path.join(output_dir, dataset_name.lower())
-        os.makedirs(dataset_results_dir, exist_ok=True)
-        processed_proteins, existing_results = load_existing_results(dataset_results_dir)
-        
+        dataset_results_dir = os.path.join(output_dir, dataset_name.lower().replace(" ", "_"))
         protein_ids = protein_ids_map[dataset_name]
-        
-        # The resume logic is now handled inside evaluate_dataset and worker_fn_improved
-        # We just need to check if all proteins are already evaluated before spawning processes
-        remaining_ids, existing_results_list = load_and_filter_protein_ids(
+
+        remaining_protein_ids, existing_results = load_and_filter_protein_ids(
             dataset_name, protein_ids, output_dir, resume_from_dir
         )
 
-        if not remaining_ids:
+        if not remaining_protein_ids:
             print(f"All proteins already evaluated for {dataset_name}")
-            results = aggregate_protein_results(existing_results_list)
+            results = aggregate_protein_results(existing_results)
             elapsed_time = 0
         else:
             start_time = time.time()
             
+            # Create a new dataset with only the remaining proteins
+            if dataset_name == 'validation':
+                dataset_path = cfg.dataset.val_dir
+            else:
+                dataset_path = cfg.dataset.test_dir
+            
+            todo_dataset = Cath(remaining_protein_ids, dataset_path)
+            todo_dataset_with_ids = CathWithID(todo_dataset, remaining_protein_ids)
+
             # Use multiprocessing queue for results
             result_queue = mp.Queue()
             
             # Spawn worker processes
             mp.spawn(
                 worker_fn_improved,
-                args=(world_size, cfg, dataset_name, result_queue, protein_ids, output_dir),
+                args=(world_size, cfg, dataset_name, result_queue, todo_dataset_with_ids, output_dir),
                 nprocs=world_size,
                 join=True
             )
             
-            # Get aggregated results
-            results = result_queue.get()
+            # Get aggregated metrics for the newly evaluated proteins
+            new_metrics = result_queue.get()
             elapsed_time = time.time() - start_time
+
+            # After workers finish, reload all results from disk for final aggregation
+            _, all_protein_results_map = load_existing_results(dataset_results_dir)
+            results = aggregate_protein_results(list(all_protein_results_map.values()))
+
+            # Update with metrics that are hard to aggregate from files (e.g., BLOSUM)
+            for key, value in new_metrics.items():
+                if 'nssr' in key:
+                    results[key] = value
         
         results['evaluation_time_seconds'] = elapsed_time
         results['evaluation_time_minutes'] = elapsed_time / 60
@@ -824,7 +843,8 @@ def evaluate_multi_gpu_main(cfg, output_dir, experiment, num_gpus, resume_from_d
     save_evaluation_results(cfg, all_results, output_dir)
 
 
-def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, protein_ids, output_dir):
+
+def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, todo_dataset_with_ids, output_dir):
     """Improved worker function using standard data parallelism."""
     # Set up distributed environment
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -848,35 +868,34 @@ def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, protei
     torch.cuda.set_device(device)
     set_seed()
 
-    # Load dataset in worker
-    if dataset_name == 'validation':
-        dataset_path = cfg.dataset.val_dir
-    else:
-        dataset_path = cfg.dataset.test_dir
-    
-    protein_ids_in_worker = os.listdir(dataset_path)
-    dataset = Cath(protein_ids_in_worker, dataset_path)
+    # The dataset is now pre-filtered and passed in
+    dataset_with_ids = todo_dataset_with_ids
     
     # Initialize model on this GPU
     model, _ = initialize_model(cfg, device)
     model.eval()
     enable_dropout(model)
     
-    # Create distributed sampler for the original dataset
+    # Create distributed sampler for the dataset WITH IDS
     sampler = DistributedSampler(
-        dataset, 
+        dataset_with_ids, 
         num_replicas=world_size, 
         rank=rank, 
         shuffle=False
     )
     
     collator = CollatorDiff()
+    
+    # Create custom collate function JUST LIKE SINGLE-GPU
+    def collate_fn(batch):
+        return collate_with_ids(batch, collator)
+    
     dataloader = DataLoader(
-        dataset,
+        dataset_with_ids,
         batch_size=cfg.evaluation.batch_size,
         sampler=sampler,
         num_workers=max(2, cfg.evaluation.num_workers // world_size),
-        collate_fn=collator,
+        collate_fn=collate_fn,
         pin_memory=True,
         prefetch_factor=2,
         persistent_workers=True
@@ -894,15 +913,26 @@ def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, protei
     # BLOSUM tracking
     local_nssr42, local_nssr62, local_nssr80, local_nssr90 = [], [], [], []
     
+    # Set up for saving protein results - JUST LIKE SINGLE-GPU!
+    dataset_results_dir = os.path.join(output_dir, dataset_name.lower().replace(" ", "_"))
+    processed_proteins_in_worker = set() # Track proteins processed by this worker
+    
     # Get optimization settings
     use_amp = cfg.evaluation.use_amp and device.type == 'cuda'
     ensemble_num = cfg.evaluation.ensemble_num
     cache_clear_freq = 5 if ensemble_num > 20 else 10
     
     with torch.no_grad():
-        for batch_idx, (g_batch, ipa_batch) in enumerate(
+        for batch_idx, batch_data in enumerate(
             tqdm(dataloader, desc=f"GPU {rank}", disable=rank != 0)
         ):
+            # HANDLE THE SAME WAY AS SINGLE-GPU!!!
+            if isinstance(batch_data, tuple) and len(batch_data) == 2:
+                (g_batch, ipa_batch), batch_protein_ids = batch_data
+            else:
+                g_batch, ipa_batch = batch_data
+                batch_protein_ids = None
+                
             g_batch = g_batch.to(device)
             ipa_batch = ipa_batch.to(device) if ipa_batch is not None else None
             
@@ -918,10 +948,50 @@ def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, protei
             # Update streaming metrics
             metrics.update(mean_logits, g_batch)
             
-            # Calculate BLOSUM metrics if needed
-            if evaluator.blosum_eval:
+            # SAVE PER-PROTEIN RESULTS LIKE SINGLE-GPU DOES!!!
+            if batch_protein_ids and dataset_results_dir:
                 pred_seqs = mean_logits.argmax(dim=-1)
                 target_seqs = g_batch.x.argmax(dim=-1)
+                
+                # Per-protein metrics using ptr boundaries
+                for i in range(len(g_batch.ptr) - 1):
+                    start, end = g_batch.ptr[i], g_batch.ptr[i+1]
+                    
+                    protein_id = batch_protein_ids[i]
+                    
+                    # Calculate recovery for this protein
+                    pred_protein = pred_seqs[start:end]
+                    target_protein = target_seqs[start:end]
+                    protein_correct = (pred_protein == target_protein).sum()
+                    protein_samples = end - start
+                    protein_recovery = (protein_correct / protein_samples).item()
+                    
+                    # Calculate log probabilities
+                    log_probs = F.log_softmax(mean_logits[start:end], dim=-1)
+                    target_log_probs = torch.gather(log_probs, -1, target_protein.unsqueeze(-1)).squeeze(-1)
+                    protein_log_prob = target_log_probs.sum().item()
+                    
+                    # Save result
+                    protein_result = {
+                        'recovery': protein_recovery,
+                        'correct': protein_correct.item(),
+                        'samples': protein_samples,
+                        'log_probs': protein_log_prob
+                    }
+                    
+                    result_path = os.path.join(dataset_results_dir, f"{protein_id}_result.json")
+                    save_protein_result(result_path, protein_result)
+                    processed_proteins_in_worker.add(protein_id)
+                    
+                    if rank == 0 and len(processed_proteins_in_worker) % 100 == 0:
+                        print(f"[PROGRESS] Worker 0 has saved {len(processed_proteins_in_worker)} proteins.")
+            
+            # Calculate BLOSUM metrics if needed
+            if evaluator.blosum_eval:
+                if not batch_protein_ids:  # Only compute if not already done above
+                    pred_seqs = mean_logits.argmax(dim=-1)
+                    target_seqs = g_batch.x.argmax(dim=-1)
+                    
                 for i in range(len(g_batch.ptr) - 1):
                     start, end = g_batch.ptr[i], g_batch.ptr[i+1]
                     pred_protein_seq = pred_seqs[start:end]
