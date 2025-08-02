@@ -20,7 +20,7 @@ from model.prior_diff import Prior_Diff
 from evaluator import Evaluator
 from utils import enable_dropout, set_seed
 from prettytable import PrettyTable
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import torch.cuda.amp as amp
 import pickle
@@ -278,6 +278,41 @@ class StreamingMetrics:
         return results
 
 
+def load_and_filter_protein_ids(dataset_name, protein_ids, results_dir, resume_from_dir=None):
+    """Loads existing results and filters protein IDs to find what's left to evaluate."""
+    processed_proteins = set()
+    existing_results = {}
+
+    # Load from resume directory first
+    if resume_from_dir:
+        resume_dataset_dir = os.path.join(resume_from_dir, dataset_name.lower().replace(" ", "_"))
+        if os.path.exists(resume_dataset_dir):
+            resumed_p, resumed_r = load_existing_results(resume_dataset_dir)
+            processed_proteins.update(resumed_p)
+            existing_results.update(resumed_r)
+            print(f"Resuming from {resume_dataset_dir}: Found {len(resumed_p)} previously evaluated proteins.")
+
+    # Load from current results directory and merge
+    current_dataset_dir = os.path.join(results_dir, dataset_name.lower().replace(" ", "_"))
+    os.makedirs(current_dataset_dir, exist_ok=True)
+    current_p, current_r = load_existing_results(current_dataset_dir)
+    
+    newly_processed_count = len(current_p - processed_proteins)
+    if newly_processed_count > 0:
+        print(f"Found {newly_processed_count} additional evaluated proteins in the current results directory.")
+
+    processed_proteins.update(current_p)
+    existing_results.update(current_r)
+
+    # Filter out processed proteins
+    remaining_protein_ids = [pid for pid in protein_ids if pid not in processed_proteins]
+    
+    print(f"Total unique proteins already processed: {len(processed_proteins)}")
+    print(f"Remaining proteins to evaluate: {len(remaining_protein_ids)}")
+
+    return remaining_protein_ids, list(existing_results.values())
+
+
 def vectorized_ensemble_sample(model, g_batch, ipa_batch, ensemble_num, cfg, use_amp=False):
     """Use torch.vmap for efficient ensemble predictions if available."""
     # Disable vmap for now - it doesn't work well with complex models
@@ -317,34 +352,34 @@ def vectorized_ensemble_sample(model, g_batch, ipa_batch, ensemble_num, cfg, use
     return torch.stack(ens_logits)
 
 
-def evaluate_dataset(model, dataloader, evaluator, device, cfg, dataset_name="Dataset", results_dir=None, protein_ids=None):
+def evaluate_dataset(model, dataloader, evaluator, device, cfg, dataset_name="Dataset", results_dir=None, protein_ids=None, resume_from_dir=None):
     """Evaluate model on a dataset with protein-level checkpointing."""
     model.eval()
     enable_dropout(model)
     
     # If results_dir is provided, check for existing results
-    processed_proteins = set()
     protein_results = []
     dataset_results_dir = None
     
     if results_dir and protein_ids:
         dataset_results_dir = os.path.join(results_dir, dataset_name.lower().replace(" ", "_"))
         os.makedirs(dataset_results_dir, exist_ok=True)
-        processed_proteins, existing_results = load_existing_results(dataset_results_dir)
         
-        if processed_proteins:
-            print(f"Found {len(processed_proteins)} already evaluated proteins")
-            # Convert existing results to list format
-            protein_results = list(existing_results.values())
-            
-            # Skip already processed proteins
-            remaining_indices = [i for i, pid in enumerate(protein_ids) if pid not in processed_proteins]
-            if not remaining_indices:
-                print(f"All proteins already evaluated for {dataset_name}")
-                # Aggregate and return existing results
-                return aggregate_protein_results(protein_results)
-            
-            print(f"Remaining proteins to evaluate: {len(remaining_indices)}")
+        # This function now handles both resume and current directories
+        remaining_protein_ids, protein_results = load_and_filter_protein_ids(
+            dataset_name, protein_ids, results_dir, resume_from_dir
+        )
+
+        if not remaining_protein_ids:
+            print(f"All proteins already evaluated for {dataset_name}")
+            return aggregate_protein_results(protein_results)
+
+        # Filter the dataset to only include remaining proteins
+        # This is a simplification; in a real scenario, you might need to re-create the dataloader
+        # For this example, we assume the dataloader will still iterate through all, and we will skip inside the loop
+        processed_proteins = set(protein_ids) - set(remaining_protein_ids)
+    else:
+        processed_proteins = set()
     
     # Initialize streaming metrics
     metrics = StreamingMetrics(device=device, distributed=False)
@@ -542,11 +577,16 @@ def main(cfg: DictConfig):
     results_base_dir = os.path.join('./results', hash_short)
     os.makedirs(results_base_dir, exist_ok=True)
     
+    # Check for resume directory
+    resume_from_dir = cfg.evaluation.get('resume_from_dir', None)
+    
     print("="*80)
     print(f"MapDiff Checkpoint Evaluation")
     print(f"Results directory: {results_base_dir}")
     print(f"Hash: {hash_short}")
     print(f"Checkpoint: {cfg.evaluation.checkpoint_path}")
+    if resume_from_dir:
+        print(f"Resuming from: {resume_from_dir}")
     print("="*80)
     
     # Save configuration and hash info
@@ -594,18 +634,18 @@ def main(cfg: DictConfig):
         print(f"Using {num_gpus} GPUs for parallel evaluation")
         mp.set_start_method('spawn', force=True)
         # Multi-GPU evaluation
-        evaluate_multi_gpu_main(cfg, results_base_dir, experiment, num_gpus)
+        evaluate_multi_gpu_main(cfg, results_base_dir, experiment, num_gpus, resume_from_dir)
     else:
         # Single GPU evaluation
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
-        evaluate_single_gpu_main(cfg, results_base_dir, experiment, device)
+        evaluate_single_gpu_main(cfg, results_base_dir, experiment, device, resume_from_dir)
     
     if experiment:
         experiment.end()
 
 
-def evaluate_single_gpu_main(cfg, output_dir, experiment, device):
+def evaluate_single_gpu_main(cfg, output_dir, experiment, device, resume_from_dir=None):
     """Main function for single GPU evaluation."""
     set_seed()
     
@@ -661,7 +701,8 @@ def evaluate_single_gpu_main(cfg, output_dir, experiment, device):
         results = evaluate_dataset(model, dataloader, evaluator, device, cfg, 
                                  dataset_name.capitalize() + " Set", 
                                  results_dir=output_dir,
-                                 protein_ids=protein_ids)
+                                 protein_ids=protein_ids,
+                                 resume_from_dir=resume_from_dir)
         elapsed_time = time.time() - start_time
         
         results['evaluation_time_seconds'] = elapsed_time
@@ -683,9 +724,26 @@ def evaluate_single_gpu_main(cfg, output_dir, experiment, device):
     save_evaluation_results(cfg, all_results, output_dir)
 
 
-def evaluate_multi_gpu_main(cfg, output_dir, experiment, num_gpus):
+def evaluate_multi_gpu_main(cfg, output_dir, experiment, num_gpus, resume_from_dir=None):
     """Main function for multi-GPU evaluation using improved strategy."""
     world_size = min(num_gpus, cfg.evaluation.get('max_gpus', num_gpus))
+
+    def find_free_port():
+        import socket
+        from contextlib import closing
+        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+            s.bind(('', 0))
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            return s.getsockname()[1]
+
+    # Find a free port and update config
+    if world_size > 1:
+        master_port = find_free_port()
+        OmegaConf.set_struct(cfg, False)
+        cfg.evaluation.master_port = master_port
+        OmegaConf.set_struct(cfg, True)
+        if cfg.logging.get('verbose', True):
+            print(f"Using free port {master_port} for distributed evaluation.")
     
     # Load datasets
     print("\nLoading datasets...")
@@ -718,14 +776,16 @@ def evaluate_multi_gpu_main(cfg, output_dir, experiment, num_gpus):
         
         protein_ids = protein_ids_map[dataset_name]
         
-        if len(processed_proteins) == len(protein_ids):
+        # The resume logic is now handled inside evaluate_dataset and worker_fn_improved
+        # We just need to check if all proteins are already evaluated before spawning processes
+        remaining_ids, existing_results_list = load_and_filter_protein_ids(
+            dataset_name, protein_ids, output_dir, resume_from_dir
+        )
+
+        if not remaining_ids:
             print(f"All proteins already evaluated for {dataset_name}")
-            # Aggregate existing results
-            protein_results = list(existing_results.values())
-            results = aggregate_protein_results(protein_results)
-            elapsed_time = 0  # No evaluation time if using cached results
-            # Add BLOSUM metrics if available
-            # Note: We'd need to save BLOSUM metrics per protein to fully support this
+            results = aggregate_protein_results(existing_results_list)
+            elapsed_time = 0
         else:
             start_time = time.time()
             
@@ -769,7 +829,19 @@ def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, protei
     # Set up distributed environment
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = str(cfg.evaluation.get('master_port', '12355'))
-    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+    
+    # Set NCCL environment variables for better stability
+    os.environ['NCCL_BLOCKING_WAIT'] = '1'
+    os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+    
+    # Increase timeout for large-scale multi-GPU setups
+    dist.init_process_group(
+        backend='nccl', 
+        rank=rank, 
+        world_size=world_size,
+        timeout=timedelta(minutes=30)
+    )
+    dist.barrier()
     
     # Set device
     device = torch.device(f'cuda:{rank}')

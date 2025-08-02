@@ -30,6 +30,8 @@ evaluation:
   use_multi_gpu: true   # Set to true to use multiple GPUs (task-based parallelism)
   max_gpus: 8          # Maximum number of GPUs to use
   num_cpu_workers: 32  # Number of CPU workers for data loading (up to 128)
+  master_port: 12355   # Port for distributed training (change if conflicts)
+  resume_from_dir: null  # Path to previous results directory to resume from (e.g., ./results/abc123def456)
   
 logging:
   save_tables: true      # Save PrettyTable output
