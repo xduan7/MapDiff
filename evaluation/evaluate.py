@@ -930,12 +930,8 @@ def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, todo_d
         for batch_idx, batch_data in enumerate(
             tqdm(dataloader, desc=f"GPU {rank}", disable=rank != 0)
         ):
-            # HANDLE THE SAME WAY AS SINGLE-GPU!!!
-            if isinstance(batch_data, tuple) and len(batch_data) == 2:
-                (g_batch, ipa_batch), batch_protein_ids = batch_data
-            else:
-                g_batch, ipa_batch = batch_data
-                batch_protein_ids = None
+            # We always use CathWithID, so batch_data is always ((g_batch, ipa_batch), protein_ids)
+            (g_batch, ipa_batch), batch_protein_ids = batch_data
                 
             g_batch = g_batch.to(device)
             ipa_batch = ipa_batch.to(device) if ipa_batch is not None else None
