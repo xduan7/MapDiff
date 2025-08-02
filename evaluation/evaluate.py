@@ -67,6 +67,17 @@ def collate_with_ids(batch, original_collator):
     return (g_batch, ipa_batch), protein_ids
 
 
+class CustomCollator:
+    """A picklable collator that wraps the original collator."""
+    def __init__(self):
+        # Instantiate the actual collator here
+        self.collator = CollatorDiff()
+
+    def __call__(self, batch):
+        # This is the logic that was in the local collate_fn
+        return collate_with_ids(batch, self.collator)
+
+
 def cal_stats_metric(values):
     mean_value = np.mean(values)
     median_value = np.median(values)
@@ -684,23 +695,19 @@ def evaluate_single_gpu_main(cfg, output_dir, experiment, device, resume_from_di
     
     # Evaluate each dataset
     all_results = {}
-    collator = CollatorDiff()
+    collator = CustomCollator()
     
     for dataset_name, dataset in datasets_to_eval.items():
         # Create dataset with IDs
         protein_ids = protein_ids_map[dataset_name]
         dataset_with_ids = CathWithID(dataset, protein_ids)
         
-        # Create custom collate function
-        def collate_fn(batch):
-            return collate_with_ids(batch, collator)
-        
         dataloader = DataLoader(
             dataset_with_ids, 
             batch_size=cfg.evaluation.batch_size, 
             shuffle=False,
             num_workers=cfg.evaluation.num_workers, 
-            collate_fn=collate_fn,
+            collate_fn=collator,
             pin_memory=True
         )
         
@@ -884,18 +891,15 @@ def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, todo_d
         shuffle=False
     )
     
-    collator = CollatorDiff()
-    
-    # Create partial function for collate_fn to avoid pickling issues
-    from functools import partial
-    collate_fn = partial(collate_with_ids, original_collator=collator)
+    # Use the picklable collator
+    collator = CustomCollator()
     
     dataloader = DataLoader(
         dataset_with_ids,
         batch_size=cfg.evaluation.batch_size,
         sampler=sampler,
         num_workers=max(2, cfg.evaluation.num_workers // world_size),
-        collate_fn=collate_fn,
+        collate_fn=collator,
         pin_memory=True,
         prefetch_factor=2,
         persistent_workers=True
