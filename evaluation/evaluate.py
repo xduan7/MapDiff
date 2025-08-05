@@ -1007,9 +1007,15 @@ def worker_fn_improved(rank, world_size, cfg, dataset_name, result_queue, todo_d
             if (batch_idx + 1) % cache_clear_freq == 0:
                 torch.cuda.empty_cache()
     
+    # All workers must enter this section together to avoid timeouts.
+    dist.barrier()
+
     # Compute metrics (will be reduced across all processes)
     results = metrics.compute()
     
+    # All workers must enter this section together to avoid timeouts.
+    dist.barrier()
+
     # Aggregate BLOSUM metrics if available
     if evaluator.blosum_eval:
         # All ranks must participate in gather_object
